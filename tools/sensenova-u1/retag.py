@@ -15,6 +15,7 @@ Output:
 """
 
 import argparse
+import json
 import re
 import sys
 import tempfile
@@ -37,6 +38,7 @@ N_CTX_TRAIN    = 16384
 RMS_EPS        = 1e-6
 ROPE_FREQ_BASE = 5e6
 ROPE_FREQ_BASE_SPATIAL = 1e4
+VISION_N_EMBD  = 1024
 
 LM_ROOT = {
     "language_model.model.embed_tokens.weight": "token_embd.weight",
@@ -176,13 +178,10 @@ def detect_file_type(src: Path):
     return gguf.LlamaFileType.MOSTLY_F16
 
 
-def write_lm(args, reader, writer):
-    names = {t.name: t for t in reader.tensors}
-    tokens, toktypes = load_tokenizer_vocab(args.config)
-    # set after the torch import above, so its caches do not land in the output dir
-    tempfile.tempdir = str(args.out.parent)
+def add_lm_kv(writer, name: str, config_dir: Path, file_type):
+    tokens, toktypes = load_tokenizer_vocab(config_dir)
 
-    writer.add_name(args.name)
+    writer.add_name(name)
     writer.add_context_length(N_CTX_TRAIN)
     writer.add_embedding_length(N_EMBD)
     writer.add_block_count(N_LAYER)
@@ -192,7 +191,7 @@ def write_lm(args, reader, writer):
     writer.add_layer_norm_rms_eps(RMS_EPS)
     writer.add_rope_freq_base(ROPE_FREQ_BASE)
     writer.add_rope_freq_base_spatial(ROPE_FREQ_BASE_SPATIAL)
-    writer.add_file_type(detect_file_type(args.src))
+    writer.add_file_type(file_type)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
     writer.add_tokenizer_model("gpt2")
@@ -200,8 +199,44 @@ def write_lm(args, reader, writer):
     writer.add_token_list(tokens)
     writer.add_token_types(toktypes)
 
-    special_vocab = gguf.SpecialVocab(args.config, load_merges=True)
+    special_vocab = gguf.SpecialVocab(config_dir, load_merges=True)
     special_vocab.add_to_gguf(writer)
+
+
+def load_fm_config(config_dir: Path):
+    cfg = json.loads((config_dir / "config.json").read_text())
+    return {
+        "noise_scale":               float(cfg.get("noise_scale", 1.0)),
+        "noise_scale_mode":          cfg.get("noise_scale_mode", "resolution"),
+        "noise_scale_base_seq_len":  int(cfg.get("noise_scale_base_image_seq_len", 64)),
+        "noise_scale_max_value":     float(cfg.get("noise_scale_max_value", 16.0)),
+        "add_noise_scale_embedding": bool(cfg.get("add_noise_scale_embedding", True)),
+        "patch_size":                int(cfg.get("patch_size", 16)),
+        "merge_size":                int(round(1.0/float(cfg.get("downsample_ratio", 0.5)))),
+        "rope_freq_base":            float(cfg.get("vision_config", {}).get("rope_theta_vision", 1e4)),
+    }
+
+
+def add_fm_kv(writer, name: str, fm_cfg, head_type: str):
+    writer.add_name(name)
+    writer.add_string("sensenova_u1_fm.head_type", head_type)
+    writer.add_uint32("sensenova_u1_fm.patch_size", fm_cfg["patch_size"])
+    writer.add_uint32("sensenova_u1_fm.merge_size", fm_cfg["merge_size"])
+    writer.add_uint32("sensenova_u1_fm.n_embd", N_EMBD)
+    writer.add_uint32("sensenova_u1_fm.vision_n_embd", VISION_N_EMBD)
+    writer.add_float32("sensenova_u1_fm.rope_freq_base", fm_cfg["rope_freq_base"])
+    writer.add_float32("sensenova_u1_fm.noise_scale", fm_cfg["noise_scale"])
+    writer.add_uint32("sensenova_u1_fm.noise_scale_base_seq_len", fm_cfg["noise_scale_base_seq_len"])
+    writer.add_float32("sensenova_u1_fm.noise_scale_max_value", fm_cfg["noise_scale_max_value"])
+    writer.add_bool("sensenova_u1_fm.add_noise_scale_embedding", fm_cfg["add_noise_scale_embedding"])
+    writer.add_string("sensenova_u1_fm.noise_scale_mode", fm_cfg["noise_scale_mode"])
+
+
+def write_lm(args, reader, writer):
+    names = {t.name: t for t in reader.tensors}
+    add_lm_kv(writer, args.name, args.config, detect_file_type(args.src))
+    # set after the torch import in load_tokenizer_vocab, so its caches do not land in the output dir
+    tempfile.tempdir = str(args.out.parent)
 
     # concatenated tensors are read together with their primary name, which may
     # come later in the file
@@ -247,18 +282,7 @@ def write_fm(args, reader, writer):
     if has_conv == has_linear:
         raise ValueError("cannot determine pixel head type")
 
-    writer.add_name(args.name)
-    writer.add_string("sensenova_u1_fm.head_type", "conv" if has_conv else "linear")
-    writer.add_uint32("sensenova_u1_fm.patch_size", 16)
-    writer.add_uint32("sensenova_u1_fm.merge_size", 2)
-    writer.add_uint32("sensenova_u1_fm.n_embd", N_EMBD)
-    writer.add_uint32("sensenova_u1_fm.vision_n_embd", 1024)
-    writer.add_float32("sensenova_u1_fm.rope_freq_base", 10000.0)
-    writer.add_float32("sensenova_u1_fm.noise_scale", 1.0)
-    writer.add_uint32("sensenova_u1_fm.noise_scale_base_seq_len", 64)
-    writer.add_float32("sensenova_u1_fm.noise_scale_max_value", 16.0)
-    writer.add_bool("sensenova_u1_fm.add_noise_scale_embedding", True)
-    writer.add_string("sensenova_u1_fm.noise_scale_mode", "resolution")
+    add_fm_kv(writer, args.name, load_fm_config(args.config), "conv" if has_conv else "linear")
 
     n = 0
     for t in reader.tensors:
