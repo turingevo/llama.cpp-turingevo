@@ -41,6 +41,8 @@ void llama_model_sensenova_u1::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_sensenova_u1::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
+    gen_layers.resize(n_layer);
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     // output
@@ -66,6 +68,36 @@ void llama_model_sensenova_u1::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+        auto & gen = gen_layers[i];
+
+        gen.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM,   "gen.weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        gen.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,      "gen.weight", i), {n_embd, n_embd_head_k * n_head}, TENSOR_NOT_REQUIRED);
+        gen.wk        = create_tensor(tn(LLM_TENSOR_ATTN_K,      "gen.weight", i), {n_embd, n_embd_gqa}, TENSOR_NOT_REQUIRED);
+        gen.wv        = create_tensor(tn(LLM_TENSOR_ATTN_V,      "gen.weight", i), {n_embd, n_embd_gqa}, TENSOR_NOT_REQUIRED);
+        gen.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "gen.weight", i), {n_embd_head_k * n_head, n_embd}, TENSOR_NOT_REQUIRED);
+
+        gen.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "gen.weight", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        gen.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "gen.weight", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
+
+        gen.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "gen.weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        gen.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "gen.weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
+        gen.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "gen.weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED);
+        gen.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "gen.weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
+    }
+
+    output_norm_gen = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "gen.weight"), {n_embd}, TENSOR_NOT_REQUIRED);
+    has_gen = output_norm_gen != nullptr;
+
+    if (has_gen) {
+        for (int i = 0; i < n_layer; ++i) {
+            const auto & gen = gen_layers[i];
+            if (!gen.attn_norm || !gen.wq || !gen.wk || !gen.wv || !gen.wo ||
+                !gen.attn_q_norm || !gen.attn_k_norm || !gen.ffn_norm ||
+                !gen.ffn_gate || !gen.ffn_down || !gen.ffn_up) {
+                throw std::runtime_error("SenseNova U1: incomplete generation branch in layer " + std::to_string(i));
+            }
+        }
     }
 }
 
@@ -77,6 +109,15 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // embedding batches carry image latents and run the generation branch
+    const bool gen_pass = ubatch.embd != nullptr;
+
+    if (gen_pass && !model.has_gen) {
+        GGML_ABORT("%s: generation branch weights are missing\n", __func__);
+    }
+
+    const auto & model_layers = gen_pass ? model.gen_layers : model.layers;
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -102,11 +143,12 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
 
     auto normalize_and_rotate = [&](ggml_tensor * x, ggml_tensor * weight) {
         const int64_t heads = x->ne[1];
+
         x = ggml_reshape_4d(ctx0, x, n_embd_head/2, 2, heads, n_tokens);
         x = normalize(x, ggml_reshape_2d(ctx0, weight, n_embd_head/2, 2));
         x = ggml_reshape_3d(ctx0, x, n_embd_head, heads, n_tokens);
 
-        // Normalize temporal and spatial halves separately; rotate time, height, then width.
+        // normalize temporal and spatial halves separately; rotate time, height, then width
         for (int axis = 0; axis < 3; ++axis) {
             const int dims = axis == 0 ? n_embd_head/2 : n_embd_head/4;
             const int offset = axis == 0 ? 0 : n_embd_head/2 + (axis - 1)*n_embd_head/4;
@@ -123,29 +165,31 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model_layers[il];
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
 
         // norm
-        cur = normalize(inpL, model.layers[il].attn_norm);
+        cur = normalize(inpL, layer.attn_norm);
         cb(cur, "attn_norm", il);
 
         // self-attention
         {
             // compute Q and K and RoPE them
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = normalize_and_rotate(Qcur, model.layers[il].attn_q_norm);
-            Kcur = normalize_and_rotate(Kcur, model.layers[il].attn_k_norm);
+            Qcur = normalize_and_rotate(Qcur, layer.attn_q_norm);
+            Kcur = normalize_and_rotate(Kcur, layer.attn_k_norm);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    layer.wo, layer.wo_b, layer.wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -156,13 +200,13 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network
-        cur = normalize(ffn_inp, model.layers[il].ffn_norm);
+        cur = normalize(ffn_inp, layer.ffn_norm);
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-            model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-            model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-            model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+            layer.ffn_up,   NULL, layer.ffn_up_s,
+            layer.ffn_gate, NULL, layer.ffn_gate_s,
+            layer.ffn_down, NULL, layer.ffn_down_s,
             NULL,
             LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
@@ -177,14 +221,15 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
     }
     cur = inpL;
 
-    cur = normalize(cur, model.output_norm);
+    cur = normalize(cur, gen_pass ? model.output_norm_gen : model.output_norm);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (!gen_pass && !cparams.embeddings) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 }

@@ -621,6 +621,11 @@ struct llama_model_sensenova_u1 : public llama_model_base {
 
     float rope_freq_base_spatial = 10000.0f;
 
+    // generation branch of the MoT layers, used for embedding batches
+    std::vector<llama_layer> gen_layers;
+    struct ggml_tensor * output_norm_gen = nullptr;
+    bool has_gen = false;
+
     struct graph : public llm_graph_context {
         graph(const llama_model_sensenova_u1 & model, const llm_graph_params & params);
     };
