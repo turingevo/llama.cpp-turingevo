@@ -36,6 +36,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    bool gen_pass = false;        // route the whole batch through the generation branch (models with separate gen weights)
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

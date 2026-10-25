@@ -110,8 +110,7 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // embedding batches carry image latents and run the generation branch
-    const bool gen_pass = ubatch.embd != nullptr;
+    const bool gen_pass = cparams.gen_pass;
 
     if (gen_pass && !model.has_gen) {
         GGML_ABORT("%s: generation branch weights are missing\n", __func__);

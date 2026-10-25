@@ -1392,6 +1392,19 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::set_gen_pass(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.gen_pass == value) {
+        return;
+    }
+
+    cparams.gen_pass = value;
+
+    // the flag selects different weights, so the graph topology may change
+    sched_need_reserve = true;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4223,6 +4236,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_set_gen_pass(llama_context * ctx, bool gen_pass) {
+    ctx->set_gen_pass(gen_pass);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
