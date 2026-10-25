@@ -54,11 +54,11 @@ void put_chunk(std::vector<uint8_t> & out, const char * type, const std::vector<
 
 } // namespace
 
-bool png_write_rgb(
-        const std::string & path,
+bool png_encode_rgb(
         const uint8_t * rgb,
         int w,
         int h,
+        std::vector<uint8_t> & out,
         std::string & err) {
     if (w <= 0 || h <= 0) {
         err = "invalid image size";
@@ -100,19 +100,32 @@ bool png_write_rgb(
     ihdr.push_back(0); // filter
     ihdr.push_back(0); // interlace
 
-    std::vector<uint8_t> out;
     static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    out.clear();
     out.insert(out.end(), sig, sig + 8);
     put_chunk(out, "IHDR", ihdr);
     put_chunk(out, "IDAT", z);
     put_chunk(out, "IEND", {});
+    return true;
+}
+
+bool png_write_rgb(
+        const std::string & path,
+        const uint8_t * rgb,
+        int w,
+        int h,
+        std::string & err) {
+    std::vector<uint8_t> png;
+    if (!png_encode_rgb(rgb, w, h, png, err)) {
+        return false;
+    }
 
     FILE * f = fopen(path.c_str(), "wb");
     if (f == nullptr) {
         err = "cannot open " + path;
         return false;
     }
-    const bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
+    const bool ok = fwrite(png.data(), 1, png.size(), f) == png.size();
     fclose(f);
     if (!ok) {
         err = "failed to write " + path;
