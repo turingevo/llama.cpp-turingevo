@@ -51,6 +51,7 @@ static void print_usage(const char * prog) {
             "\n"
             "endpoints:\n"
             "  POST /v1/images/generations   OpenAI Images API\n"
+            "  POST /v1/images/edits         OpenAI Images API, multipart or JSON with base64 images\n"
             "  POST /v1/infographic/generate private protocol used by omni-note\n"
             "  POST /generate                native protocol (legacy)\n"
             "  GET  /images/{file}           files written for url responses\n"
@@ -130,6 +131,89 @@ static std::string base64_encode(const uint8_t * data, size_t len) {
         out.push_back('=');
     }
     return out;
+}
+
+static int base64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode(const std::string & in, std::vector<uint8_t> & out, std::string & err) {
+    out.clear();
+    out.reserve(in.size()/4*3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            continue;
+        }
+        const int v = base64_value(c);
+        if (v < 0) {
+            err = "invalid base64 data";
+            return false;
+        }
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t) ((acc >> bits) & 0xff));
+        }
+    }
+    return true;
+}
+
+// input images may be a file path, a data URL, or raw base64
+static bool make_image_input(const std::string & value, sensenova_image_input & img, std::string & err) {
+    if (value.rfind("data:", 0) == 0) {
+        const size_t comma = value.find(',');
+        if (comma == std::string::npos) {
+            err = "invalid data URL";
+            return false;
+        }
+        return base64_decode(value.substr(comma + 1), img.data, err);
+    }
+    std::error_code ec;
+    if (fs::exists(value, ec) && !ec) {
+        img.path = value;
+        return true;
+    }
+    return base64_decode(value, img.data, err);
+}
+
+static bool set_json_images(const nlohmann::json & j, std::vector<sensenova_image_input> & images, std::string & err) {
+    auto append = [&](const nlohmann::json & item) -> bool {
+        if (!item.is_string()) {
+            err = "image entries must be strings";
+            return false;
+        }
+        sensenova_image_input img;
+        if (!make_image_input(item.get<std::string>(), img, err)) {
+            return false;
+        }
+        images.push_back(std::move(img));
+        return true;
+    };
+
+    for (const char * key : {"image", "images"}) {
+        if (!j.contains(key)) {
+            continue;
+        }
+        const nlohmann::json & v = j[key];
+        if (v.is_array()) {
+            for (const auto & item : v) {
+                if (!append(item)) {
+                    return false;
+                }
+            }
+        } else if (!append(v)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void json_error_legacy(httplib::Response & res, int status, const std::string & message) {
@@ -225,25 +309,35 @@ static bool write_file(const fs::path & path, const std::vector<uint8_t> & data,
     return true;
 }
 
+struct gen_output {
+    std::vector<uint8_t> png;
+    int width = 0;
+    int height = 0;
+    std::string think_text;
+    int64_t elapsed_ms = 0;
+};
+
 static bool generate_png(
         sensenova_model & model,
         std::mutex & mu,
         const sensenova_gen_params & p,
-        std::vector<uint8_t> & png,
-        int64_t & elapsed_ms,
+        gen_output & out,
         std::string & err) {
-    std::vector<uint8_t> rgb;
+    sensenova_result result;
     const auto t0 = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (!sensenova_generate(model, p, rgb, err)) {
+        if (!sensenova_generate(model, p, result, err)) {
             return false;
         }
     }
-    if (!png_encode_rgb(rgb.data(), p.width, p.height, png, err)) {
+    if (!png_encode_rgb(result.rgb.data(), result.width, result.height, out.png, err)) {
         return false;
     }
-    elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    out.width      = result.width;
+    out.height     = result.height;
+    out.think_text = std::move(result.think_text);
+    out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
     return true;
 }
@@ -254,6 +348,20 @@ static std::string request_base_url(const httplib::Request & req, const server_a
         host = a.host + ":" + std::to_string(a.port);
     }
     return "http://" + host;
+}
+
+static void openai_images_response(
+        httplib::Response & res,
+        const nlohmann::json & data,
+        int64_t elapsed_ms,
+        const std::string & model_name) {
+    nlohmann::json out = {
+        {"created", (int64_t) std::time(nullptr)},
+        {"data", data},
+        {"model", model_name},
+    };
+    res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
+    res.set_content(out.dump(), "application/json");
 }
 
 static httplib::Server * g_server = nullptr;
@@ -302,7 +410,7 @@ int main(int argc, char ** argv) {
     httplib::Server svr;
     std::mutex mu;
 
-    svr.set_payload_max_length(1 << 20);
+    svr.set_payload_max_length(64 << 20);
     svr.set_read_timeout(600);
     svr.set_write_timeout(600);
 
@@ -337,9 +445,15 @@ int main(int argc, char ** argv) {
         j["model_name"] = a.model_name;
         j["n_embd"]     = model->n_embd;
         j["output_dir"] = out_root.string();
+        j["supports"] = {
+            {"think", true},
+            {"edits", true},
+            {"cfg_norm", {"none", "global", "channel"}},
+        };
         j["defaults"] = {
             {"width", 1024}, {"height", 1024}, {"steps", 8},
-            {"seed", 42}, {"cfg", 1.0}, {"shift", 3.0},
+            {"seed", 42}, {"cfg", 1.0}, {"img_cfg", 1.0}, {"shift", 3.0},
+            {"cfg_norm", "none"}, {"think", false}, {"auto_pixels", 1024*1024},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -378,7 +492,16 @@ int main(int argc, char ** argv) {
             p.steps  = j.value("steps", p.steps);
             p.seed   = j.value("seed", p.seed);
             p.cfg    = j.value("cfg", p.cfg);
+            p.img_cfg = j.value("img_cfg", p.img_cfg);
+            p.cfg_norm = j.value("cfg_norm", p.cfg_norm);
             p.shift  = j.value("shift", p.shift);
+            p.think  = j.value("think", p.think);
+            p.max_think_tokens = j.value("max_think_tokens", p.max_think_tokens);
+            p.auto_size_pixels = j.value("auto_pixels", p.auto_size_pixels);
+            if (!set_json_images(j, p.images, err)) {
+                json_error_legacy(res, 400, err);
+                return;
+            }
             response_format = j.value("response_format", response_format);
         } catch (const std::exception & e) {
             json_error_legacy(res, 400, std::string("invalid request: ") + e.what());
@@ -389,8 +512,16 @@ int main(int argc, char ** argv) {
             json_error_legacy(res, 400, "prompt is required");
             return;
         }
-        if (p.width <= 0 || p.height <= 0 || p.width % 32 != 0 || p.height % 32 != 0) {
-            json_error_legacy(res, 400, "width and height must be positive multiples of 32");
+        if ((p.width == 0) != (p.height == 0)) {
+            json_error_legacy(res, 400, "width and height must be set together");
+            return;
+        }
+        if (p.width != 0 && p.width % 32 != 0) {
+            json_error_legacy(res, 400, "width and height must be multiples of 32");
+            return;
+        }
+        if (p.width < 0 || p.height < 0) {
+            json_error_legacy(res, 400, "width and height must be positive");
             return;
         }
         if (p.steps <= 0) {
@@ -402,25 +533,31 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        std::vector<uint8_t> png;
-        int64_t elapsed_ms = 0;
-        if (!generate_png(*model, mu, p, png, elapsed_ms, err)) {
+        gen_output out;
+        if (!generate_png(*model, mu, p, out, err)) {
             json_error_legacy(res, 500, err);
             return;
         }
 
         if (response_format == "b64_json") {
             nlohmann::json j;
-            j["image"]      = base64_encode(png.data(), png.size());
-            j["width"]      = p.width;
-            j["height"]     = p.height;
+            j["image"]      = base64_encode(out.png.data(), out.png.size());
+            j["width"]      = out.width;
+            j["height"]     = out.height;
             j["steps"]      = p.steps;
             j["seed"]       = p.seed;
-            j["elapsed_ms"] = elapsed_ms;
+            j["elapsed_ms"] = out.elapsed_ms;
+            if (p.think) {
+                j["think"] = out.think_text;
+            }
             res.set_content(j.dump(), "application/json");
         } else {
-            res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
-            res.set_content(reinterpret_cast<const char *>(png.data()), png.size(), "image/png");
+            res.set_header("X-Elapsed-Ms", std::to_string(out.elapsed_ms));
+            if (p.think) {
+                res.set_header("X-Think-Text", base64_encode(
+                        reinterpret_cast<const uint8_t *>(out.think_text.data()), out.think_text.size()));
+            }
+            res.set_content(reinterpret_cast<const char *>(out.png.data()), out.png.size(), "image/png");
         }
     });
 
@@ -456,12 +593,9 @@ int main(int argc, char ** argv) {
             p.steps = j.value("num_steps", p.steps);
             p.cfg   = j.value("cfg_scale", p.cfg);
             p.shift = j.value("timestep_shift", p.shift);
-            if (j.contains("cfg_norm") && !j["cfg_norm"].is_null()) {
-                if (j["cfg_norm"].get<std::string>() != "none") {
-                    json_error_openai(res, 400, "cfg_norm: only none is supported");
-                    return;
-                }
-            }
+            p.think = j.value("think", p.think);
+            p.max_think_tokens = j.value("max_think_tokens", p.max_think_tokens);
+            p.cfg_norm = j.value("cfg_norm", p.cfg_norm);
         } catch (const std::exception & e) {
             json_error_openai(res, 400, std::string("invalid request: ") + e.what());
             return;
@@ -483,6 +617,10 @@ int main(int argc, char ** argv) {
             json_error_openai(res, 400, "response_format must be b64_json or url");
             return;
         }
+        if (p.cfg_norm != "none" && p.cfg_norm != "global" && p.cfg_norm != "channel") {
+            json_error_openai(res, 400, "cfg_norm must be none, global or channel");
+            return;
+        }
 
         nlohmann::json data = nlohmann::json::array();
         int64_t elapsed_ms = 0;
@@ -494,24 +632,28 @@ int main(int argc, char ** argv) {
                 q.seed = (int) (((int64_t) p.seed + i) & 0x7fffffff);
             }
 
-            std::vector<uint8_t> png;
-            int64_t item_ms = 0;
-            if (!generate_png(*model, mu, q, png, item_ms, err)) {
+            gen_output out;
+            if (!generate_png(*model, mu, q, out, err)) {
                 json_error_openai(res, 500, err, "server_error");
                 return;
             }
-            elapsed_ms += item_ms;
+            elapsed_ms += out.elapsed_ms;
 
+            nlohmann::json item;
             if (response_format == "b64_json") {
-                data.push_back({{"b64_json", base64_encode(png.data(), png.size())}});
+                item["b64_json"] = base64_encode(out.png.data(), out.png.size());
             } else {
                 const std::string name = "openai_" + random_hex(12) + ".png";
-                if (!write_file(out_root / name, png, err)) {
+                if (!write_file(out_root / name, out.png, err)) {
                     json_error_openai(res, 500, err, "server_error");
                     return;
                 }
-                data.push_back({{"url", request_base_url(req, a) + "/images/" + name}});
+                item["url"] = request_base_url(req, a) + "/images/" + name;
             }
+            if (!out.think_text.empty()) {
+                item["revised_prompt"] = out.think_text;
+            }
+            data.push_back(std::move(item));
         }
 
         nlohmann::json out = {
@@ -521,6 +663,168 @@ int main(int argc, char ** argv) {
         };
         res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
         res.set_content(out.dump(), "application/json");
+    });
+
+    // OpenAI Images API, image editing
+    svr.Post("/v1/images/edits", [&](const httplib::Request & req, httplib::Response & res) {
+        sensenova_gen_params p;
+        int n = 1;
+        std::string model_name = a.model_name;
+        std::string response_format = "b64_json";
+        std::string size = "auto";
+        std::string err;
+
+        if (req.is_multipart_form_data()) {
+            auto field = [&](const char * key, const std::string & def) {
+                return req.form.has_field(key) ? req.form.get_field(key) : def;
+            };
+            auto field_int = [&](const char * key, int def) {
+                return req.form.has_field(key) ? atoi(req.form.get_field(key).c_str()) : def;
+            };
+            auto field_float = [&](const char * key, float def) {
+                return req.form.has_field(key) ? (float) atof(req.form.get_field(key).c_str()) : def;
+            };
+
+            p.prompt    = field("prompt", std::string());
+            n           = field_int("n", 1);
+            model_name  = field("model", a.model_name);
+            response_format = field("response_format", response_format);
+            size        = field("size", size);
+            p.seed      = field_int("seed", p.seed);
+            p.steps     = field_int("num_steps", p.steps);
+            p.cfg       = field_float("cfg_scale", p.cfg);
+            p.img_cfg   = field_float("img_cfg_scale", p.img_cfg);
+            p.cfg_norm  = field("cfg_norm", p.cfg_norm);
+            p.shift     = field_float("timestep_shift", p.shift);
+            p.input_max_pixels = field_int("input_max_pixels", p.input_max_pixels);
+            p.auto_size_pixels = field_int("auto_pixels", p.auto_size_pixels);
+            const std::string think = field("think", "false");
+            p.think = think == "true" || think == "1";
+            p.max_think_tokens = field_int("max_think_tokens", p.max_think_tokens);
+            const std::string output_format = field("output_format", "png");
+            if (output_format != "png") {
+                json_error_openai(res, 400, "output_format: only png is supported");
+                return;
+            }
+
+            for (const char * key : {"image", "image[]"}) {
+                for (const auto & f : req.form.get_files(key)) {
+                    sensenova_image_input img;
+                    img.data.assign(f.content.begin(), f.content.end());
+                    p.images.push_back(std::move(img));
+                }
+            }
+        } else {
+            try {
+                const nlohmann::json j = nlohmann::json::parse(req.body);
+                if (!j.is_object()) {
+                    json_error_openai(res, 400, "request body must be a JSON object");
+                    return;
+                }
+                p.prompt = j.value("prompt", std::string());
+                n = j.value("n", 1);
+                if (j.contains("model") && !j["model"].is_null()) {
+                    model_name = j["model"].get<std::string>();
+                }
+                response_format = j.value("response_format", response_format);
+                size = j.value("size", size);
+                p.seed     = j.value("seed", p.seed);
+                p.steps    = j.value("num_steps", p.steps);
+                p.cfg      = j.value("cfg_scale", p.cfg);
+                p.img_cfg  = j.value("img_cfg_scale", p.img_cfg);
+                p.cfg_norm = j.value("cfg_norm", p.cfg_norm);
+                p.shift    = j.value("timestep_shift", p.shift);
+                p.input_max_pixels = j.value("input_max_pixels", p.input_max_pixels);
+                p.auto_size_pixels = j.value("auto_pixels", p.auto_size_pixels);
+                p.think    = j.value("think", p.think);
+                p.max_think_tokens = j.value("max_think_tokens", p.max_think_tokens);
+                const std::string output_format = j.value("output_format", std::string("png"));
+                if (output_format != "png") {
+                    json_error_openai(res, 400, "output_format: only png is supported");
+                    return;
+                }
+                if (!set_json_images(j, p.images, err)) {
+                    json_error_openai(res, 400, err);
+                    return;
+                }
+            } catch (const std::exception & e) {
+                json_error_openai(res, 400, std::string("invalid request: ") + e.what());
+                return;
+            }
+        }
+
+        if (p.prompt.empty()) {
+            json_error_openai(res, 400, "prompt is required");
+            return;
+        }
+        if (p.images.empty()) {
+            json_error_openai(res, 400, "at least one input image is required");
+            return;
+        }
+        if (n < 1 || n > 4) {
+            json_error_openai(res, 400, "n must be between 1 and 4");
+            return;
+        }
+        if (p.steps < 1 || p.steps > 100) {
+            json_error_openai(res, 400, "num_steps must be between 1 and 100");
+            return;
+        }
+        if (response_format != "b64_json" && response_format != "url") {
+            json_error_openai(res, 400, "response_format must be b64_json or url");
+            return;
+        }
+        if (p.cfg_norm != "none" && p.cfg_norm != "global" && p.cfg_norm != "channel") {
+            json_error_openai(res, 400, "cfg_norm must be none, global or channel");
+            return;
+        }
+
+        std::string s = size;
+        for (char & c : s) {
+            c = (char) tolower((unsigned char) c);
+        }
+        if (s.empty() || s == "auto") {
+            p.width  = 0;
+            p.height = 0;
+        } else if (!parse_size(s, p.width, p.height, err)) {
+            json_error_openai(res, 400, err);
+            return;
+        }
+
+        nlohmann::json data = nlohmann::json::array();
+        int64_t elapsed_ms = 0;
+        for (int i = 0; i < n; ++i) {
+            sensenova_gen_params q = p;
+            if (p.seed < 0) {
+                q.seed = random_seed();
+            } else {
+                q.seed = (int) (((int64_t) p.seed + i) & 0x7fffffff);
+            }
+
+            gen_output out;
+            if (!generate_png(*model, mu, q, out, err)) {
+                json_error_openai(res, 500, err, "server_error");
+                return;
+            }
+            elapsed_ms += out.elapsed_ms;
+
+            nlohmann::json item;
+            if (response_format == "b64_json") {
+                item["b64_json"] = base64_encode(out.png.data(), out.png.size());
+            } else {
+                const std::string name = "edit_" + random_hex(12) + ".png";
+                if (!write_file(out_root / name, out.png, err)) {
+                    json_error_openai(res, 500, err, "server_error");
+                    return;
+                }
+                item["url"] = request_base_url(req, a) + "/images/" + name;
+            }
+            if (!out.think_text.empty()) {
+                item["revised_prompt"] = out.think_text;
+            }
+            data.push_back(std::move(item));
+        }
+
+        openai_images_response(res, data, elapsed_ms, model_name);
     });
 
     // private protocol used by omni-note
@@ -540,13 +844,16 @@ int main(int argc, char ** argv) {
             p.seed   = j.value("seed", p.seed);
             p.steps  = j.value("num_steps", p.steps);
             p.cfg    = j.value("cfg_scale", p.cfg);
+            p.img_cfg = j.value("img_cfg_scale", p.img_cfg);
+            p.cfg_norm = j.value("cfg_norm", p.cfg_norm);
             p.shift  = j.value("timestep_shift", p.shift);
+            p.think  = j.value("think", p.think);
+            p.max_think_tokens = j.value("max_think_tokens", p.max_think_tokens);
+            p.auto_size_pixels = j.value("auto_pixels", p.auto_size_pixels);
             output_dir = j.value("output_dir", std::string());
-            if (j.contains("cfg_norm") && !j["cfg_norm"].is_null()) {
-                if (j["cfg_norm"].get<std::string>() != "none") {
-                    private_error(res, "cfg_norm: only none is supported");
-                    return;
-                }
+            if (!set_json_images(j, p.images, err)) {
+                private_error(res, err);
+                return;
             }
         } catch (const std::exception & e) {
             private_error(res, std::string("invalid request: ") + e.what());
@@ -557,8 +864,16 @@ int main(int argc, char ** argv) {
             private_error(res, "prompt is required");
             return;
         }
-        if (p.width <= 0 || p.height <= 0 || p.width % 32 != 0 || p.height % 32 != 0) {
-            private_error(res, "width and height must be positive multiples of 32");
+        if ((p.width == 0) != (p.height == 0)) {
+            private_error(res, "width and height must be set together");
+            return;
+        }
+        if (p.width != 0 && p.width % 32 != 0) {
+            private_error(res, "width and height must be multiples of 32");
+            return;
+        }
+        if (p.width < 0 || p.height < 0) {
+            private_error(res, "width and height must be positive");
             return;
         }
         if (p.steps < 1 || p.steps > 100) {
@@ -590,30 +905,32 @@ int main(int argc, char ** argv) {
             q.seed = random_seed();
         }
 
-        std::vector<uint8_t> png;
-        int64_t elapsed_ms = 0;
-        if (!generate_png(*model, mu, q, png, elapsed_ms, err)) {
+        gen_output out;
+        if (!generate_png(*model, mu, q, out, err)) {
             private_error(res, err);
             return;
         }
 
         const std::string name = "infographic_" + random_hex(12) + ".png";
-        if (!write_file(dir / name, png, err)) {
+        if (!write_file(dir / name, out.png, err)) {
             private_error(res, err);
             return;
         }
 
-        nlohmann::json out = {
+        nlohmann::json j = {
             {"status", "success"},
             {"image_url", output_dir.empty() ? "/images/" + name : ""},
             {"image_path", (dir / name).string()},
-            {"generation_time", elapsed_ms / 1000.0},
-            {"width", p.width},
-            {"height", p.height},
+            {"generation_time", out.elapsed_ms / 1000.0},
+            {"width", out.width},
+            {"height", out.height},
             {"message", ""},
         };
-        res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
-        res.set_content(out.dump(), "application/json");
+        if (p.think) {
+            j["think"] = out.think_text;
+        }
+        res.set_header("X-Elapsed-Ms", std::to_string(out.elapsed_ms));
+        res.set_content(j.dump(), "application/json");
     });
 
     // model lifecycle hooks used by the omni-note manager
