@@ -25,6 +25,9 @@ struct sensenova_model {
     ~sensenova_model();
 
     bool load_fm(int width, int height, std::string & err);
+
+    // weights only, for input image encoding without generation graphs
+    bool load_fm_und(std::string & err);
 };
 
 struct sensenova_image_input {
@@ -64,6 +67,32 @@ struct sensenova_result {
     std::string think_text;
 };
 
+struct sensenova_qa_params {
+    std::string question;
+    int max_new_tokens = 1024;
+
+    // 0 keeps greedy decoding, the other fields apply only when temperature > 0
+    float temperature      = 0.0f;
+    int   top_k            = 0;
+    float top_p            = 0.95f;
+    float repeat_penalty   = 1.0f;
+    int   seed             = 42;
+
+    // per input image, 0 = auto: min(2048^2, 4096^2/n)
+    int input_max_pixels = 0;
+
+    std::vector<sensenova_image_input> images;
+};
+
+struct sensenova_qa_result {
+    std::string text;       // full reply, think block included
+    std::string think_text; // reasoning text, empty when the reply has no think block
+    std::string answer;     // reply with the think block removed
+    int n_prompt_tokens = 0;
+    int n_generated = 0;
+    bool truncated = false;
+};
+
 std::unique_ptr<sensenova_model> sensenova_model_load(
         const std::string & model_path,
         const std::string & fm_path,
@@ -75,4 +104,11 @@ bool sensenova_generate(
         sensenova_model & model,
         const sensenova_gen_params & params,
         sensenova_result & out,
+        std::string & err);
+
+// visual understanding: answer a question about the input images
+bool sensenova_understand(
+        sensenova_model & model,
+        const sensenova_qa_params & params,
+        sensenova_qa_result & out,
         std::string & err);

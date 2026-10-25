@@ -30,6 +30,13 @@ struct gen_args {
     int max_think_tokens = 1024;
     int input_max_pixels = 0;
     int auto_size_pixels = 1024*1024;
+    bool vqa = false;
+    int max_new_tokens = 1024;
+    std::string answer_output;
+    float temperature = 0.0f;
+    int top_k = 0;
+    float top_p = 0.95f;
+    float repeat_penalty = 1.0f;
 };
 
 static void print_usage(const char * prog) {
@@ -56,6 +63,13 @@ static void print_usage(const char * prog) {
             "      --think-output PATH   save the think text to a file\n"
             "      --input-max-pixels N  per input image budget (default: auto)\n"
             "      --auto-pixels N  output pixels when width and height are auto (default: 1048576)\n"
+            "      --vqa            answer the prompt as a question about -i images\n"
+            "      --max-new-tokens N    answer budget in --vqa mode (default: 1024)\n"
+            "      --answer-output PATH  save the --vqa answer to a file\n"
+            "      --temperature F  --vqa sampling temperature, 0 = greedy (default: 0)\n"
+            "      --top-k N        --vqa top-k sampling, 0 = off (default: 0)\n"
+            "      --top-p F        --vqa nucleus sampling (default: 0.95)\n"
+            "      --repeat-penalty F    --vqa repetition penalty (default: 1.0)\n"
             "  -ngl N               layers to offload to GPU (default: 999)\n"
             "  -t, --threads N      CPU threads (default: number of cores)\n",
             prog);
@@ -110,6 +124,20 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
             const char * v = next(arg.c_str()); if (!v) return false; a.input_max_pixels = atoi(v);
         } else if (arg == "--auto-pixels") {
             const char * v = next(arg.c_str()); if (!v) return false; a.auto_size_pixels = atoi(v);
+        } else if (arg == "--vqa") {
+            a.vqa = true;
+        } else if (arg == "--max-new-tokens") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.max_new_tokens = atoi(v);
+        } else if (arg == "--answer-output") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.answer_output = v;
+        } else if (arg == "--temperature") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.temperature = (float) atof(v);
+        } else if (arg == "--top-k") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.top_k = atoi(v);
+        } else if (arg == "--top-p") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.top_p = (float) atof(v);
+        } else if (arg == "--repeat-penalty") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.repeat_penalty = (float) atof(v);
         } else if (arg == "-ngl") {
             const char * v = next(arg.c_str()); if (!v) return false; a.ngl = atoi(v);
         } else if (arg == "-t" || arg == "--threads") {
@@ -131,6 +159,15 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
         fprintf(stderr, "error: max think tokens must be positive\n");
         return false;
     }
+    if (a.vqa && a.max_new_tokens <= 0) {
+        fprintf(stderr, "error: max new tokens must be positive\n");
+        return false;
+    }
+    if (a.vqa && (a.temperature < 0.0f || a.top_k < 0 || a.top_p <= 0.0f || a.top_p > 1.0f ||
+                  a.repeat_penalty <= 0.0f)) {
+        fprintf(stderr, "error: invalid sampling parameters\n");
+        return false;
+    }
     return true;
 }
 
@@ -139,7 +176,7 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, a)) {
         return 1;
     }
-    if (a.steps <= 0) {
+    if (!a.vqa && a.steps <= 0) {
         fprintf(stderr, "error: steps must be positive\n");
         return 1;
     }
@@ -149,6 +186,60 @@ int main(int argc, char ** argv) {
     if (!model) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
+    }
+
+    if (a.vqa) {
+        sensenova_qa_params q;
+        q.question = a.prompt;
+        q.max_new_tokens = a.max_new_tokens;
+        q.temperature = a.temperature;
+        q.top_k = a.top_k;
+        q.top_p = a.top_p;
+        q.repeat_penalty = a.repeat_penalty;
+        q.seed = a.seed;
+        q.input_max_pixels = a.input_max_pixels;
+        for (const std::string & path : a.images) {
+            sensenova_image_input in;
+            in.path = path;
+            q.images.push_back(std::move(in));
+        }
+        if (a.think) {
+            fprintf(stderr, "warning: --think is ignored in --vqa mode\n");
+        }
+
+        sensenova_qa_result qres;
+        if (!sensenova_understand(*model, q, qres, err)) {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+
+        if (a.print_think && !qres.think_text.empty()) {
+            printf("--- think ---\n%s\n--- think end ---\n", qres.think_text.c_str());
+        }
+        if (!a.think_output.empty()) {
+            std::ofstream f(a.think_output);
+            if (!f) {
+                fprintf(stderr, "error: cannot write %s\n", a.think_output.c_str());
+                return 1;
+            }
+            f << qres.think_text;
+        }
+        if (qres.answer.empty() && !qres.text.empty()) {
+            fprintf(stderr, "warning: reply ended inside the think block, raise --max-new-tokens\n");
+        }
+        const std::string & answer = qres.answer.empty() ? qres.text : qres.answer;
+        printf("%s\n", answer.c_str());
+        if (!a.answer_output.empty()) {
+            std::ofstream f(a.answer_output);
+            if (!f) {
+                fprintf(stderr, "error: cannot write %s\n", a.answer_output.c_str());
+                return 1;
+            }
+            f << answer << '\n';
+        }
+        fprintf(stderr, "prompt tokens: %d, answer tokens: %d%s\n", qres.n_prompt_tokens, qres.n_generated,
+                qres.truncated ? " (truncated)" : "");
+        return 0;
     }
 
     sensenova_gen_params p;

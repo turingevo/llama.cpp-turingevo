@@ -149,6 +149,11 @@ static std::string build_plain_prompt(const std::string & user) {
     return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n<img>";
 }
 
+// single turn chat prompt for visual understanding
+static std::string build_chat_prompt(const std::string & question) {
+    return "<|im_start|>user\n" + question + "<|im_end|>\n<|im_start|>assistant\n";
+}
+
 // one token of a prefix, with its M-RoPE position
 struct prefix_item {
     llama_token tok = 0;
@@ -399,6 +404,84 @@ static std::string detokenize(const llama_vocab * vocab, const std::vector<llama
     return text;
 }
 
+struct sampler_deleter {
+    void operator()(llama_sampler * s) const { llama_sampler_free(s); }
+};
+
+// null keeps greedy decoding, which is what the vendor defaults to
+static std::unique_ptr<llama_sampler, sampler_deleter> make_sampler(const sensenova_qa_params & p, int n_vocab) {
+    if (p.temperature <= 0.0f) {
+        return nullptr;
+    }
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (p.repeat_penalty != 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                n_vocab, 64, p.repeat_penalty, 0.0f, 0.0f));
+    }
+    if (p.top_k > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(p.top_k));
+    }
+    if (p.top_p < 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(p.top_p, 1));
+    }
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(p.temperature));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist((uint32_t) p.seed));
+    return std::unique_ptr<llama_sampler, sampler_deleter>(smpl);
+}
+
+// AR loop, stops at <|im_end|>, max_tokens, or stop_tok when >= 0
+static bool generate_tokens(
+        llama_context * ctx,
+        const llama_vocab * vocab,
+        llama_seq_id seq,
+        llama_pos & t,
+        int max_tokens,
+        llama_token stop_tok,
+        llama_sampler * smpl,
+        std::vector<llama_token> & ids,
+        std::string & err) {
+    llama_token eos = 0;
+    if (!token_id(vocab, "<|im_end|>", eos)) {
+        err = "cannot find the end token in the vocabulary";
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    auto sample = [&]() -> llama_token {
+        if (smpl != nullptr) {
+            return llama_sampler_sample(smpl, ctx, -1);
+        }
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        if (logits == nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return argmax_token(logits, n_vocab);
+    };
+
+    llama_token next = sample();
+    for (int i = 0; i < max_tokens; ++i) {
+        if (next == LLAMA_TOKEN_NULL) {
+            err = ids.empty() ? "no logits after the prefix pass" : "no logits during generation";
+            return false;
+        }
+        if (next == eos) {
+            break;
+        }
+        ids.push_back(next);
+        ++t;
+        if (!decode_one_token(ctx, seq, next, t)) {
+            err = "token decode failed";
+            return false;
+        }
+        if (stop_tok >= 0 && next == stop_tok) {
+            break;
+        }
+        next = sample();
+    }
+    return true;
+}
+
 static bool generate_think(
         llama_context * ctx,
         const llama_vocab * vocab,
@@ -407,44 +490,16 @@ static bool generate_think(
         int max_tokens,
         std::string & text,
         std::string & err) {
-    llama_token eos = 0;
     llama_token think_end = 0;
-    if (!token_id(vocab, "<|im_end|>", eos) || !token_id(vocab, "</think>", think_end)) {
+    if (!token_id(vocab, "</think>", think_end)) {
         err = "cannot find the think tokens in the vocabulary";
         return false;
     }
 
-    const int n_vocab = llama_vocab_n_tokens(vocab);
-
-    const float * logits = llama_get_logits_ith(ctx, -1);
-    if (logits == nullptr) {
-        err = "no logits after the prefix pass";
+    std::vector<llama_token> ids;
+    if (!generate_tokens(ctx, vocab, seq, t, max_tokens, think_end, nullptr, ids, err)) {
         return false;
     }
-    llama_token next = argmax_token(logits, n_vocab);
-
-    std::vector<llama_token> ids;
-    for (int i = 0; i < max_tokens; ++i) {
-        if (next == eos) {
-            break;
-        }
-        ids.push_back(next);
-        ++t;
-        if (!decode_one_token(ctx, seq, next, t)) {
-            err = "think token decode failed";
-            return false;
-        }
-        if (next == think_end) {
-            break;
-        }
-        logits = llama_get_logits_ith(ctx, -1);
-        if (logits == nullptr) {
-            err = "no logits during think generation";
-            return false;
-        }
-        next = argmax_token(logits, n_vocab);
-    }
-
     text = detokenize(vocab, ids);
     return true;
 }
@@ -700,6 +755,10 @@ bool sensenova_model::load_fm(int width, int height, std::string & err) {
     return true;
 }
 
+bool sensenova_model::load_fm_und(std::string & err) {
+    return load_fm(0, 0, err);
+}
+
 std::unique_ptr<sensenova_model> sensenova_model_load(
         const std::string & model_path,
         const std::string & fm_path,
@@ -727,6 +786,109 @@ std::unique_ptr<sensenova_model> sensenova_model_load(
     return out;
 }
 
+struct ctx_deleter {
+    void operator()(llama_context * c) const { llama_free(c); }
+};
+
+static std::unique_ptr<llama_context, ctx_deleter> create_context(
+        sensenova_model & model,
+        uint32_t n_ctx,
+        uint32_t n_batch,
+        uint32_t n_seq_max,
+        bool embeddings,
+        std::string & err) {
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx      = n_ctx;
+    cparams.n_batch    = n_batch;
+    cparams.n_ubatch   = n_batch;
+    // we only need the logits of the last token; without this the pp reserve
+    // graph is sized for n_batch logits, i.e. n_vocab x n_batch floats
+    cparams.n_outputs_max = 1;
+    cparams.n_seq_max  = n_seq_max;
+    cparams.kv_unified = true;
+    cparams.embeddings = embeddings;
+    cparams.no_perf    = false;
+    if (model.n_threads > 0) {
+        cparams.n_threads       = model.n_threads;
+        cparams.n_threads_batch = model.n_threads;
+    }
+
+    std::unique_ptr<llama_context, ctx_deleter> ctx(llama_init_from_model(model.model, cparams));
+    if (!ctx) {
+        err = "cannot create context";
+    }
+    return ctx;
+}
+
+// decode and resize the input images to the pixel budget
+static bool prepare_input_images(
+        const std::vector<sensenova_image_input> & src,
+        int input_max_pixels,
+        std::vector<sensenova_image> & out,
+        std::string & err) {
+    const int n_images = (int) src.size();
+    const int min_pixels = 512*512;
+
+    out.resize((size_t) n_images);
+    for (int i = 0; i < n_images; ++i) {
+        sensenova_image raw;
+        bool ok = false;
+        if (!src[i].path.empty()) {
+            ok = image_load_file(src[i].path, raw, err);
+        } else {
+            ok = image_load_memory(src[i].data.data(), src[i].data.size(), raw, err);
+        }
+        if (!ok) {
+            err = "cannot load input image: " + err;
+            return false;
+        }
+
+        const int max_pixels = input_max_pixels > 0
+            ? input_max_pixels
+            : std::min(2048*2048, (4096*4096)/std::max(1, n_images));
+        if (max_pixels < min_pixels) {
+            err = "input_max_pixels must be at least 512*512";
+            return false;
+        }
+        if (!image_prepare(raw, min_pixels, max_pixels, out[(size_t) i], err)) {
+            err = "cannot resize input image: " + err;
+            return false;
+        }
+    }
+    return true;
+}
+
+// encode the input images with the understanding branch vision embedder
+static bool encode_input_images(
+        sensenova_model & model,
+        const std::vector<sensenova_image> & inputs,
+        std::vector<std::vector<float>> & embeds,
+        std::vector<std::pair<int, int>> & grid, // token_h, token_w
+        std::vector<int> & n_tok,
+        std::string & err) {
+    const int n_images = (int) inputs.size();
+    embeds.resize((size_t) n_images);
+    grid.resize((size_t) n_images);
+    n_tok.resize((size_t) n_images);
+
+    std::vector<float> img_whc;
+    for (int i = 0; i < n_images; ++i) {
+        const sensenova_image & img = inputs[(size_t) i];
+        const int th = img.h/GRID;
+        const int tw = img.w/GRID;
+        grid[(size_t) i] = { th, tw };
+        n_tok[(size_t) i] = th*tw;
+
+        image_to_fm_input(img, img_whc);
+        embeds[(size_t) i].resize((size_t) th*tw*model.n_embd);
+        if (!model.fm->encode_ref_image(img_whc.data(), img.w, img.h, embeds[(size_t) i].data(), err)) {
+            err = "input image encode failed: " + err;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool sensenova_generate(
         sensenova_model & model,
         const sensenova_gen_params & p,
@@ -752,33 +914,9 @@ bool sensenova_generate(
     const int n_images = (int) p.images.size();
     const int min_pixels = 512*512;
 
-    // decode and resize the input images
-    std::vector<sensenova_image> inputs((size_t) n_images);
-    for (int i = 0; i < n_images; ++i) {
-        const sensenova_image_input & src = p.images[i];
-        sensenova_image raw;
-        bool ok = false;
-        if (!src.path.empty()) {
-            ok = image_load_file(src.path, raw, err);
-        } else {
-            ok = image_load_memory(src.data.data(), src.data.size(), raw, err);
-        }
-        if (!ok) {
-            err = "cannot load input image: " + err;
-            return false;
-        }
-
-        const int max_pixels = p.input_max_pixels > 0
-            ? p.input_max_pixels
-            : std::min(2048*2048, (4096*4096)/std::max(1, n_images));
-        if (max_pixels < min_pixels) {
-            err = "input_max_pixels must be at least 512*512";
-            return false;
-        }
-        if (!image_prepare(raw, min_pixels, max_pixels, inputs[(size_t) i], err)) {
-            err = "cannot resize input image: " + err;
-            return false;
-        }
+    std::vector<sensenova_image> inputs;
+    if (!prepare_input_images(p.images, p.input_max_pixels, inputs, err)) {
+        return false;
     }
 
     // resolve the output size: explicit, first input aspect, or 1024x1024
@@ -833,23 +971,11 @@ bool sensenova_generate(
     }
 
     // encode the input images once, with the understanding branch embedder
-    std::vector<std::vector<float>> img_embeds((size_t) n_images);
-    std::vector<std::pair<int, int>> img_grid((size_t) n_images); // token_h, token_w
-    std::vector<int> img_tok((size_t) n_images);
-    std::vector<float> img_whc;
-    for (int i = 0; i < n_images; ++i) {
-        const sensenova_image & img = inputs[(size_t) i];
-        const int th = img.h/GRID;
-        const int tw = img.w/GRID;
-        img_grid[(size_t) i] = { th, tw };
-        img_tok[(size_t) i] = th*tw;
-
-        image_to_fm_input(img, img_whc);
-        img_embeds[(size_t) i].resize((size_t) th*tw*n_embd);
-        if (!fm.encode_ref_image(img_whc.data(), img.w, img.h, img_embeds[(size_t) i].data(), err)) {
-            err = "input image encode failed: " + err;
-            return false;
-        }
+    std::vector<std::vector<float>> img_embeds;
+    std::vector<std::pair<int, int>> img_grid; // token_h, token_w
+    std::vector<int> img_tok;
+    if (!encode_input_images(model, inputs, img_embeds, img_grid, img_tok, err)) {
+        return false;
     }
 
     // build the three prefixes
@@ -902,28 +1028,10 @@ bool sensenova_generate(
             cond_spec.items.size(), img_cond_spec.items.size(), uncond_spec.items.size(),
             n_tokens, width, height, p.steps, p.cfg, p.img_cfg, p.think ? ", think" : "");
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx      = n_ctx;
-    cparams.n_batch    = n_batch;
-    cparams.n_ubatch   = n_batch;
-    cparams.n_seq_max  = 3;
-    cparams.kv_unified = true;
-    cparams.embeddings = true;
-    cparams.no_perf    = false;
-    if (model.n_threads > 0) {
-        cparams.n_threads       = model.n_threads;
-        cparams.n_threads_batch = model.n_threads;
-    }
-
-    llama_context * ctx_raw = llama_init_from_model(model.model, cparams);
-    if (ctx_raw == nullptr) {
-        err = "cannot create context";
+    auto ctx_holder = create_context(model, n_ctx, n_batch, 3, true, err);
+    if (!ctx_holder) {
         return false;
     }
-    struct ctx_deleter {
-        void operator()(llama_context * c) const { llama_free(c); }
-    };
-    std::unique_ptr<llama_context, ctx_deleter> ctx_holder(ctx_raw);
     llama_context * ctx = ctx_holder.get();
 
     const llama_seq_id seq_cond     = 0;
@@ -1135,5 +1243,124 @@ bool sensenova_generate(
             }
         }
     }
+    return true;
+}
+
+static void trim_text(std::string & s) {
+    const char * ws = " \t\r\n";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) {
+        s.clear();
+        return;
+    }
+    const size_t e = s.find_last_not_of(ws);
+    s = s.substr(b, e - b + 1);
+}
+
+static void split_think(const std::string & text, std::string & think, std::string & answer) {
+    const std::string open  = "<think>";
+    const std::string close = "</think>";
+    const size_t b = text.find(open);
+    if (b == std::string::npos) {
+        think.clear();
+        answer = text;
+        trim_text(answer);
+        return;
+    }
+    const size_t e = text.find(close, b + open.size());
+    if (e == std::string::npos) {
+        // reply ran out of budget inside the think block
+        think = text.substr(b + open.size());
+        answer.clear();
+        trim_text(think);
+        return;
+    }
+    think  = text.substr(b + open.size(), e - b - open.size());
+    answer = text.substr(e + close.size());
+    trim_text(think);
+    trim_text(answer);
+}
+
+bool sensenova_understand(
+        sensenova_model & model,
+        const sensenova_qa_params & p,
+        sensenova_qa_result & out,
+        std::string & err) {
+    if (p.question.empty()) {
+        err = "question is empty";
+        return false;
+    }
+    if (p.max_new_tokens <= 0) {
+        err = "max_new_tokens must be positive";
+        return false;
+    }
+
+    const int n_images = (int) p.images.size();
+
+    std::vector<sensenova_image> inputs;
+    if (!prepare_input_images(p.images, p.input_max_pixels, inputs, err)) {
+        return false;
+    }
+
+    std::vector<std::vector<float>> img_embeds;
+    std::vector<std::pair<int, int>> img_grid;
+    std::vector<int> img_tok;
+    if (n_images > 0) {
+        if (!model.load_fm_und(err)) {
+            err = "cannot load FM sidecar: " + err;
+            return false;
+        }
+        if (!model.fm->has_und_vision()) {
+            err = "the FM sidecar has no vision weights for input images, regenerate it with retag.py";
+            return false;
+        }
+        if (!encode_input_images(model, inputs, img_embeds, img_grid, img_tok, err)) {
+            return false;
+        }
+    }
+
+    const std::string question = add_missing_placeholders(p.question, n_images);
+    const std::string question_full = expand_images(question, img_tok);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model.model);
+    prefix_spec spec;
+    if (!build_prefix(vocab, build_chat_prompt(question_full), img_grid, spec, err)) {
+        err = "question prompt: " + err;
+        return false;
+    }
+
+    uint32_t n_batch = (uint32_t) spec.items.size();
+    for (int n : img_tok) {
+        n_batch = std::max<uint32_t>(n_batch, (uint32_t) n);
+    }
+    const uint32_t n_ctx = (uint32_t) spec.items.size() + (uint32_t) p.max_new_tokens + 8;
+
+    auto ctx_holder = create_context(model, n_ctx, std::max<uint32_t>(n_batch, 1), 1, false, err);
+    if (!ctx_holder) {
+        return false;
+    }
+    llama_context * ctx = ctx_holder.get();
+
+    const llama_seq_id seq = 0;
+    if (!decode_prefix(ctx, seq, spec, img_embeds, model.n_embd, true)) {
+        err = "question prefix decode failed";
+        return false;
+    }
+
+    auto smpl = make_sampler(p, llama_vocab_n_tokens(vocab));
+
+    std::vector<llama_token> ids;
+    llama_pos t = spec.max_t;
+    if (!generate_tokens(ctx, vocab, seq, t, p.max_new_tokens, -1, smpl.get(), ids, err)) {
+        err = "answer generation failed: " + err;
+        return false;
+    }
+
+    out.text = detokenize(vocab, ids);
+    trim_text(out.text);
+    split_think(out.text, out.think_text, out.answer);
+    out.n_prompt_tokens = (int) spec.items.size();
+    out.n_generated = (int) ids.size();
+    out.truncated = out.n_generated >= p.max_new_tokens;
     return true;
 }
