@@ -801,9 +801,9 @@ static std::unique_ptr<llama_context, ctx_deleter> create_context(
     cparams.n_ctx      = n_ctx;
     cparams.n_batch    = n_batch;
     cparams.n_ubatch   = n_batch;
-    // we only need the logits of the last token; without this the pp reserve
-    // graph is sized for n_batch logits, i.e. n_vocab x n_batch floats
-    cparams.n_outputs_max = 1;
+    // a text context only needs the logits of the last token, otherwise the pp reserve
+    // graph is sized for n_batch logits; embedding contexts output every token
+    cparams.n_outputs_max = embeddings ? n_batch : 1;
     cparams.n_seq_max  = n_seq_max;
     cparams.kv_unified = true;
     cparams.embeddings = embeddings;
