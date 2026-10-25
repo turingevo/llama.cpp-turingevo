@@ -50,6 +50,7 @@ static void print_usage(const char * prog) {
             "  -t, --threads N         CPU threads (default: number of cores)\n"
             "\n"
             "endpoints:\n"
+            "  POST /v1/chat/completions     OpenAI Chat API, single turn visual understanding\n"
             "  POST /v1/images/generations   OpenAI Images API\n"
             "  POST /v1/images/edits         OpenAI Images API, multipart or JSON with base64 images\n"
             "  POST /v1/infographic/generate private protocol used by omni-note\n"
@@ -364,6 +365,82 @@ static void openai_images_response(
     res.set_content(out.dump(), "application/json");
 }
 
+// OpenAI messages for a single user turn, system messages are ignored
+static bool parse_chat_request(const nlohmann::json & j, sensenova_qa_params & p, std::string & err) {
+    if (!j.contains("messages") || !j["messages"].is_array() || j["messages"].empty()) {
+        err = "messages is required";
+        return false;
+    }
+
+    bool have_user = false;
+    for (const auto & m : j["messages"]) {
+        if (!m.is_object() || !m.contains("role") || !m["role"].is_string()) {
+            err = "each message needs a role";
+            return false;
+        }
+        const std::string role = m["role"].get<std::string>();
+        if (role == "system" || role == "developer") {
+            continue;
+        }
+        if (role != "user" || have_user) {
+            err = "only a single user message is supported";
+            return false;
+        }
+        have_user = true;
+
+        const nlohmann::json & content = m["content"];
+        if (content.is_string()) {
+            p.question = content.get<std::string>();
+            continue;
+        }
+        if (!content.is_array()) {
+            err = "content must be a string or an array";
+            return false;
+        }
+        for (const auto & part : content) {
+            if (!part.is_object() || !part.contains("type") || !part["type"].is_string()) {
+                err = "invalid content part";
+                return false;
+            }
+            const std::string type = part["type"].get<std::string>();
+            if (type == "text") {
+                p.question += part.value("text", std::string());
+            } else if (type == "image_url") {
+                std::string url;
+                if (part.contains("image_url") && part["image_url"].is_object()) {
+                    url = part["image_url"].value("url", std::string());
+                }
+                if (url.empty()) {
+                    err = "image_url needs a url";
+                    return false;
+                }
+                if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+                    err = "remote image URLs are not supported, send a data URL or base64";
+                    return false;
+                }
+                sensenova_image_input img;
+                if (!make_image_input(url, img, err)) {
+                    return false;
+                }
+                p.images.push_back(std::move(img));
+            } else {
+                err = "unsupported content part: " + type;
+                return false;
+            }
+        }
+    }
+
+    if (!have_user) {
+        err = "a user message is required";
+        return false;
+    }
+    if (p.question.empty()) {
+        err = "question text is required";
+        return false;
+    }
+    return true;
+}
+
 static httplib::Server * g_server = nullptr;
 static std::atomic_flag g_terminating = ATOMIC_FLAG_INIT;
 
@@ -448,12 +525,14 @@ int main(int argc, char ** argv) {
         j["supports"] = {
             {"think", true},
             {"edits", true},
+            {"vqa", true},
             {"cfg_norm", {"none", "global", "channel"}},
         };
         j["defaults"] = {
             {"width", 1024}, {"height", 1024}, {"steps", 8},
             {"seed", 42}, {"cfg", 1.0}, {"img_cfg", 1.0}, {"shift", 3.0},
             {"cfg_norm", "none"}, {"think", false}, {"auto_pixels", 1024*1024},
+            {"max_new_tokens", 1024}, {"temperature", 0.0}, {"top_p", 0.95},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -559,6 +638,93 @@ int main(int argc, char ** argv) {
             }
             res.set_content(reinterpret_cast<const char *>(out.png.data()), out.png.size(), "image/png");
         }
+    });
+
+    // OpenAI Chat API, visual understanding
+    svr.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
+        sensenova_qa_params p;
+        std::string model_name = a.model_name;
+        std::string err;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(req.body);
+            if (!j.is_object()) {
+                json_error_openai(res, 400, "request body must be a JSON object");
+                return;
+            }
+            if (j.value("stream", false)) {
+                json_error_openai(res, 400, "stream is not supported");
+                return;
+            }
+            if (j.contains("model") && j["model"].is_string()) {
+                model_name = j["model"].get<std::string>();
+            }
+            if (!parse_chat_request(j, p, err)) {
+                json_error_openai(res, 400, err);
+                return;
+            }
+            for (const char * key : {"max_completion_tokens", "max_tokens"}) {
+                if (j.contains(key) && j[key].is_number_integer()) {
+                    p.max_new_tokens = j[key].get<int>();
+                }
+            }
+            p.temperature      = j.value("temperature", p.temperature);
+            p.top_p            = j.value("top_p", p.top_p);
+            p.top_k            = j.value("top_k", p.top_k);
+            p.repeat_penalty   = j.value("repetition_penalty", p.repeat_penalty);
+            p.seed             = j.value("seed", p.seed);
+            p.input_max_pixels = j.value("input_max_pixels", p.input_max_pixels);
+        } catch (const std::exception & e) {
+            json_error_openai(res, 400, std::string("invalid request: ") + e.what());
+            return;
+        }
+
+        if (p.max_new_tokens < 1 || p.max_new_tokens > 16384) {
+            json_error_openai(res, 400, "max_tokens must be between 1 and 16384");
+            return;
+        }
+        if (p.temperature < 0.0f || p.top_k < 0 || p.top_p <= 0.0f || p.top_p > 1.0f || p.repeat_penalty <= 0.0f) {
+            json_error_openai(res, 400, "invalid sampling parameters");
+            return;
+        }
+
+        sensenova_qa_result out;
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!sensenova_understand(*model, p, out, err)) {
+                json_error_openai(res, 500, err, "server_error");
+                return;
+            }
+        }
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        nlohmann::json message = {
+            {"role", "assistant"},
+            {"content", out.answer},
+        };
+        if (!out.think_text.empty()) {
+            message["reasoning_content"] = out.think_text;
+        }
+        nlohmann::json choice = {
+            {"index", 0},
+            {"message", message},
+            {"finish_reason", out.truncated ? "length" : "stop"},
+        };
+        nlohmann::json j = {
+            {"id", "chatcmpl-" + random_hex(16)},
+            {"object", "chat.completion"},
+            {"created", (int64_t) std::time(nullptr)},
+            {"model", model_name},
+            {"choices", nlohmann::json::array({choice})},
+            {"usage", {
+                {"prompt_tokens", out.n_prompt_tokens},
+                {"completion_tokens", out.n_generated},
+                {"total_tokens", out.n_prompt_tokens + out.n_generated},
+            }},
+        };
+        res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
+        res.set_content(j.dump(), "application/json");
     });
 
     // OpenAI Images API
