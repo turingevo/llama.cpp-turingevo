@@ -101,8 +101,7 @@ bool png_encode_rgb(
     ihdr.push_back(0); // interlace
 
     static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
-    out.clear();
-    out.insert(out.end(), sig, sig + 8);
+    out.assign(sig, sig + 8);
     put_chunk(out, "IHDR", ihdr);
     put_chunk(out, "IDAT", z);
     put_chunk(out, "IEND", {});
