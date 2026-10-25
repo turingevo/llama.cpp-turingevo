@@ -1,0 +1,8 @@
+set(TARGET llama-sensenova-server)
+add_executable(${TARGET} main.cpp)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(${TARGET} PRIVATE sensenova-core cpp-httplib vendor::nlohmann ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
