@@ -53,6 +53,7 @@ static void print_usage(const char * prog) {
             "  POST /v1/chat/completions     OpenAI Chat API, single turn visual understanding\n"
             "  POST /v1/images/generations   OpenAI Images API\n"
             "  POST /v1/images/edits         OpenAI Images API, multipart or JSON with base64 images\n"
+            "  POST /v1/interleave/generate  interleaved text and image generation\n"
             "  POST /v1/infographic/generate private protocol used by omni-note\n"
             "  POST /generate                native protocol (legacy)\n"
             "  GET  /images/{file}           files written for url responses\n"
@@ -351,6 +352,56 @@ static std::string request_base_url(const httplib::Request & req, const server_a
     return "http://" + host;
 }
 
+// split "<image>" markers into ordered text and image segments
+static nlohmann::json interleave_segments(
+        const std::string & text,
+        const std::vector<gen_output> & images,
+        const std::vector<std::string> & locs,
+        bool use_paths) {
+    static const std::string marker = "<image>";
+    nlohmann::json segs = nlohmann::json::array();
+    auto image_item = [&](size_t i) {
+        nlohmann::json item = {
+            {"type", "image"},
+            {"index", (int) i},
+            {"width", images[i].width},
+            {"height", images[i].height},
+        };
+        if (locs.empty()) {
+            item["b64_json"] = base64_encode(images[i].png.data(), images[i].png.size());
+        } else if (use_paths) {
+            item["image_path"] = locs[i];
+        } else {
+            item["url"] = locs[i];
+        }
+        return item;
+    };
+
+    size_t pos = 0;
+    size_t idx = 0;
+    for (;;) {
+        const size_t hit = text.find(marker, pos);
+        if (hit == std::string::npos) {
+            break;
+        }
+        if (idx < images.size()) {
+            if (hit > pos) {
+                segs.push_back({{"type", "text"}, {"text", text.substr(pos, hit - pos)}});
+            }
+            segs.push_back(image_item(idx++));
+        }
+        pos = hit + marker.size();
+    }
+    if (pos < text.size()) {
+        segs.push_back({{"type", "text"}, {"text", text.substr(pos)}});
+    }
+    // a marker always comes with an image, but keep every image reachable
+    while (idx < images.size()) {
+        segs.push_back(image_item(idx++));
+    }
+    return segs;
+}
+
 static void openai_images_response(
         httplib::Response & res,
         const nlohmann::json & data,
@@ -526,6 +577,7 @@ int main(int argc, char ** argv) {
             {"think", true},
             {"edits", true},
             {"vqa", true},
+            {"interleave", true},
             {"cfg_norm", {"none", "global", "channel"}},
         };
         j["defaults"] = {
@@ -533,6 +585,7 @@ int main(int argc, char ** argv) {
             {"seed", 42}, {"cfg", 1.0}, {"img_cfg", 1.0}, {"shift", 3.0},
             {"cfg_norm", "none"}, {"think", false}, {"auto_pixels", 1024*1024},
             {"max_new_tokens", 1024}, {"temperature", 0.0}, {"top_p", 0.95},
+            {"max_images", 3}, {"interleave_max_new_tokens", 4096},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -1096,6 +1149,175 @@ int main(int argc, char ** argv) {
             j["think"] = out.think_text;
         }
         res.set_header("X-Elapsed-Ms", std::to_string(out.elapsed_ms));
+        res.set_content(j.dump(), "application/json");
+    });
+
+    // interleaved text and image generation
+    svr.Post("/v1/interleave/generate", [&](const httplib::Request & req, httplib::Response & res) {
+        sensenova_interleave_params p;
+        std::string response_format = "b64_json";
+        std::string output_dir;
+        std::string model_name = a.model_name;
+        std::string err;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(req.body);
+            if (!j.is_object()) {
+                json_error_legacy(res, 400, "request body must be a JSON object");
+                return;
+            }
+            p.prompt = j.value("prompt", std::string());
+            if (j.contains("model") && j["model"].is_string()) {
+                model_name = j["model"].get<std::string>();
+            }
+            p.width  = j.value("width", p.width);
+            p.height = j.value("height", p.height);
+            p.auto_pixels = j.value("auto_pixels", p.auto_pixels);
+            p.steps  = j.value("num_steps", p.steps);
+            p.seed   = j.value("seed", p.seed);
+            p.shift  = j.value("timestep_shift", p.shift);
+            p.max_images = j.value("max_images", p.max_images);
+            p.max_new_tokens = j.value("max_new_tokens", p.max_new_tokens);
+            p.think  = j.value("think", p.think);
+            p.temperature = j.value("temperature", p.temperature);
+            p.top_k = j.value("top_k", p.top_k);
+            p.top_p = j.value("top_p", p.top_p);
+            p.repeat_penalty = j.value("repetition_penalty", p.repeat_penalty);
+            p.input_max_pixels = j.value("input_max_pixels", p.input_max_pixels);
+            response_format = j.value("response_format", response_format);
+            output_dir = j.value("output_dir", std::string());
+            if (!set_json_images(j, p.images, err)) {
+                json_error_legacy(res, 400, err);
+                return;
+            }
+        } catch (const std::exception & e) {
+            json_error_legacy(res, 400, std::string("invalid request: ") + e.what());
+            return;
+        }
+
+        if (p.prompt.empty()) {
+            json_error_legacy(res, 400, "prompt is required");
+            return;
+        }
+        if ((p.width == 0) != (p.height == 0)) {
+            json_error_legacy(res, 400, "width and height must be set together");
+            return;
+        }
+        if (p.width != 0 && p.width % 32 != 0) {
+            json_error_legacy(res, 400, "width and height must be multiples of 32");
+            return;
+        }
+        if (p.width < 0 || p.height < 0) {
+            json_error_legacy(res, 400, "width and height must be positive");
+            return;
+        }
+        if (p.steps < 1 || p.steps > 100) {
+            json_error_legacy(res, 400, "num_steps must be between 1 and 100");
+            return;
+        }
+        if (p.max_images < 1 || p.max_images > 8) {
+            json_error_legacy(res, 400, "max_images must be between 1 and 8");
+            return;
+        }
+        if (p.max_new_tokens < 1 || p.max_new_tokens > 16384) {
+            json_error_legacy(res, 400, "max_new_tokens must be between 1 and 16384");
+            return;
+        }
+        if (p.temperature < 0.0f || p.top_k < 0 || p.top_p <= 0.0f || p.top_p > 1.0f ||
+                p.repeat_penalty <= 0.0f) {
+            json_error_legacy(res, 400, "invalid sampling parameters");
+            return;
+        }
+        if (response_format != "b64_json" && response_format != "url") {
+            json_error_legacy(res, 400, "response_format must be b64_json or url");
+            return;
+        }
+        if (!output_dir.empty() && !a.allow_output_dir) {
+            json_error_legacy(res, 400, "output_dir is disabled, start server with --allow-output-dir");
+            return;
+        }
+        if (p.width == 0 && !p.images.empty() && p.auto_pixels < 512*512) {
+            json_error_legacy(res, 400, "auto_pixels must be at least 262144");
+            return;
+        }
+
+        fs::path dir = out_root;
+        if (!output_dir.empty()) {
+            std::error_code dir_ec;
+            dir = fs::absolute(output_dir, dir_ec).lexically_normal();
+            if (dir_ec) {
+                json_error_legacy(res, 400, "invalid output_dir: " + dir_ec.message());
+                return;
+            }
+            fs::create_directories(dir, dir_ec);
+            if (dir_ec) {
+                json_error_legacy(res, 400, "cannot create output_dir: " + dir_ec.message());
+                return;
+            }
+        }
+
+        sensenova_interleave_params q = p;
+        if (q.seed < 0) {
+            q.seed = random_seed();
+        }
+
+        sensenova_interleave_result out;
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!sensenova_interleave(*model, q, out, err)) {
+                json_error_legacy(res, 500, err);
+                return;
+            }
+        }
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+
+        std::vector<gen_output> images(out.images.size());
+        for (size_t i = 0; i < out.images.size(); ++i) {
+            images[i].width  = out.images[i].width;
+            images[i].height = out.images[i].height;
+            if (!png_encode_rgb(out.images[i].rgb.data(), out.images[i].width, out.images[i].height,
+                                images[i].png, err)) {
+                json_error_legacy(res, 500, err);
+                return;
+            }
+        }
+
+        std::vector<std::string> locs;
+        bool use_paths = false;
+        if (response_format == "url") {
+            use_paths = !output_dir.empty();
+            const std::string stem = "interleave_" + random_hex(12);
+            for (size_t i = 0; i < images.size(); ++i) {
+                const std::string name = stem + "_" + std::to_string(i) + ".png";
+                if (!write_file(dir / name, images[i].png, err)) {
+                    json_error_legacy(res, 500, err);
+                    return;
+                }
+                locs.push_back(use_paths ? (dir / name).string()
+                                         : request_base_url(req, a) + "/images/" + name);
+            }
+        }
+
+        nlohmann::json j = {
+            {"id", "interleave-" + random_hex(16)},
+            {"created", (int64_t) std::time(nullptr)},
+            {"model", model_name},
+            {"text", out.text},
+            {"answer", out.answer},
+            {"segments", interleave_segments(out.text, images, locs, use_paths)},
+            {"finish_reason", out.truncated ? "length" : "stop"},
+            {"usage", {
+                {"prompt_tokens", out.n_prompt_tokens},
+                {"text_tokens", out.n_generated},
+                {"images", (int) out.images.size()},
+                {"total_tokens", out.n_prompt_tokens + out.n_generated},
+            }},
+        };
+        if (p.think) {
+            j["think"] = out.think_text;
+        }
+        res.set_header("X-Elapsed-Ms", std::to_string(elapsed_ms));
         res.set_content(j.dump(), "application/json");
     });
 
