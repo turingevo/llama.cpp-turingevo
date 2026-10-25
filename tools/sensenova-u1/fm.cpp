@@ -67,14 +67,126 @@ bool get_kv_str(gguf_context * gf, const char * key, std::string & out, std::str
 
 } // namespace
 
+fm_vision_encoder::~fm_vision_encoder() {
+    if (ga)      ggml_gallocr_free(ga);
+    if (ctx)     ggml_free(ctx);
+    if (buf_pos) ggml_backend_buffer_free(buf_pos);
+    if (ctx_pos) ggml_free(ctx_pos);
+}
+
+bool fm_vision_encoder::build(
+        ggml_backend_t backend,
+        const fm_params & p,
+        int img_w_,
+        int img_h_,
+        ggml_tensor * patch_w,
+        ggml_tensor * patch_b,
+        ggml_tensor * dense_w,
+        ggml_tensor * dense_b,
+        std::string & err) {
+    img_w = img_w_;
+    img_h = img_h_;
+
+    if (img_w <= 0 || img_h <= 0 || img_w % 32 != 0 || img_h % 32 != 0) {
+        err = "image size must be a positive multiple of 32";
+        return false;
+    }
+
+    const int64_t pxx = img_w/p.patch_size;
+    const int64_t pxy = img_h/p.patch_size;
+    const int64_t n_patch = pxx*pxy;
+
+    ctx_pos = make_ctx(1u << 20);
+    if (ctx_pos == nullptr) {
+        err = "cannot create position context";
+        return false;
+    }
+    pos_x = ggml_new_tensor_1d(ctx_pos, GGML_TYPE_I32, n_patch);
+    pos_y = ggml_new_tensor_1d(ctx_pos, GGML_TYPE_I32, n_patch);
+
+    buf_pos = ggml_backend_alloc_ctx_tensors(ctx_pos, backend);
+    if (buf_pos == nullptr) {
+        err = "cannot allocate position buffer";
+        return false;
+    }
+    {
+        std::vector<int32_t> x(n_patch), y(n_patch);
+        for (int64_t j = 0; j < n_patch; ++j) {
+            x[j] = (int32_t) (j % pxx);
+            y[j] = (int32_t) (j / pxx);
+        }
+        ggml_backend_tensor_set(pos_x, x.data(), 0, n_patch*sizeof(int32_t));
+        ggml_backend_tensor_set(pos_y, y.data(), 0, n_patch*sizeof(int32_t));
+    }
+
+    // vision patch embedder: conv 16/16, rope, conv 2/2
+    ctx = make_ctx(128u << 20);
+    if (ctx == nullptr) {
+        err = "cannot create vision embedder context";
+        return false;
+    }
+    {
+        ggml_context * c = ctx;
+        in = ggml_new_tensor_3d(c, GGML_TYPE_F32, img_w, img_h, 3);
+        ggml_set_input(in);
+
+        ggml_tensor * x = ggml_conv_2d_direct(c, patch_w, in, p.patch_size, p.patch_size, 0, 0, 1, 1);
+        x = ggml_add(c, x, ggml_reshape_3d(c, patch_b, 1, 1, p.vision_n_embd));
+        x = ggml_gelu_erf(c, x);
+
+        x = ggml_cont(c, ggml_permute(c, x, 1, 2, 0, 3));
+        x = ggml_reshape_3d(c, x, p.vision_n_embd, 1, n_patch);
+
+        const int64_t n_half = p.vision_n_embd/2;
+        ggml_tensor * xa = ggml_view_3d(c, x, n_half, 1, n_patch, x->nb[1], x->nb[2], 0);
+        ggml_tensor * xb = ggml_view_3d(c, x, n_half, 1, n_patch, x->nb[1], x->nb[2], n_half*x->nb[0]);
+
+        xa = ggml_rope_ext(c, xa, pos_x, nullptr, n_half, GGML_ROPE_TYPE_NORMAL, 0,
+                p.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        xb = ggml_rope_ext(c, xb, pos_y, nullptr, n_half, GGML_ROPE_TYPE_NORMAL, 0,
+                p.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        ggml_tensor * r = ggml_concat(c, xa, xb, 0);
+        r = ggml_reshape_3d(c, r, p.vision_n_embd, pxx, pxy);
+        r = ggml_cont(c, ggml_permute(c, r, 2, 0, 1, 3));
+
+        ggml_tensor * y = ggml_conv_2d_direct(c, dense_w, r, p.merge_size, p.merge_size, 0, 0, 1, 1);
+        y = ggml_add(c, y, ggml_reshape_3d(c, dense_b, 1, 1, p.n_embd));
+
+        out = ggml_cont(c, ggml_permute(c, y, 1, 2, 0, 3));
+        ggml_set_output(out);
+    }
+    if (out->ne[0] != p.n_embd || out->ne[1] != pxx/2 || out->ne[2] != pxy/2) {
+        err = "unexpected vision embedder output shape";
+        return false;
+    }
+
+    gf = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_build_forward_expand(gf, out);
+    ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        err = "cannot allocate vision embedder graph";
+        return false;
+    }
+
+    return true;
+}
+
+bool fm_vision_encoder::encode(ggml_backend_t backend, const float * img, float * out_t, std::string & err) {
+    ggml_backend_tensor_set(in, img, 0, ggml_nbytes(in));
+    if (!run_graph(backend, gf, err)) {
+        return false;
+    }
+    ggml_backend_tensor_get(out, out_t, 0, ggml_nbytes(out));
+    return true;
+}
+
 fm_context::~fm_context() {
-    if (ga_enc) ggml_gallocr_free(ga_enc);
     if (ga_ts)  ggml_gallocr_free(ga_ts);
     if (ga_h1)  ggml_gallocr_free(ga_h1);
     if (ga_h2)  ggml_gallocr_free(ga_h2);
     if (ga_hl)  ggml_gallocr_free(ga_hl);
 
-    if (ctx_enc) ggml_free(ctx_enc);
     if (ctx_ts)  ggml_free(ctx_ts);
     if (ctx_h1)  ggml_free(ctx_h1);
     if (ctx_h2)  ggml_free(ctx_h2);
@@ -87,12 +199,10 @@ fm_context::~fm_context() {
 bool fm_context::load(
         const std::string & path,
         ggml_backend_t backend_,
-        int img_w_,
-        int img_h_,
+        int img_w,
+        int img_h,
         std::string & err) {
     backend = backend_;
-    img_w = img_w_;
-    img_h = img_h_;
 
     if (img_w <= 0 || img_h <= 0 || img_w % 32 != 0 || img_h % 32 != 0) {
         err = "image size must be a positive multiple of 32";
@@ -150,8 +260,7 @@ bool fm_context::load(
 
     const int64_t pxx = img_w/p.patch_size;
     const int64_t pxy = img_h/p.patch_size;
-    const int64_t n_patch = pxx*pxy;
-    const int64_t n_tok = n_patch/(p.merge_size*p.merge_size);
+    const int64_t n_tok = pxx*pxy/(p.merge_size*p.merge_size);
 
     ctx_w = make_ctx(4u << 20);
     if (ctx_w == nullptr) {
@@ -201,6 +310,26 @@ bool fm_context::load(
         ok = ok && (dense_b = take("vision.dense_embd.bias", 1, ne)) != nullptr;
     }
 
+    // input images use a separate vision embedder, not all sidecars have it
+    const bool has_und =
+        gguf_find_tensor(gf, "vision_und.patch_embd.weight") >= 0 ||
+        gguf_find_tensor(gf, "vision_und.patch_embd.bias")   >= 0 ||
+        gguf_find_tensor(gf, "vision_und.dense_embd.weight") >= 0 ||
+        gguf_find_tensor(gf, "vision_und.dense_embd.bias")   >= 0;
+    if (has_und) {
+        patch_w_und = take("vision_und.patch_embd.weight", 4, ne_patch_w);
+        ok = patch_w_und != nullptr;
+        {
+            const int64_t ne[1] = { p.vision_n_embd };
+            ok = ok && (patch_b_und = take("vision_und.patch_embd.bias", 1, ne)) != nullptr;
+        }
+        ok = ok && (dense_w_und = take("vision_und.dense_embd.weight", 4, ne_dense_w)) != nullptr;
+        {
+            const int64_t ne[1] = { p.n_embd };
+            ok = ok && (dense_b_und = take("vision_und.dense_embd.bias", 1, ne)) != nullptr;
+        }
+    }
+
     {
         const int64_t ne0[2] = { 256, p.n_embd };
         const int64_t ne1[2] = { p.n_embd, p.n_embd };
@@ -238,9 +367,6 @@ bool fm_context::load(
         ok = ok && (fc2_b = take("head.fc2.bias", 1, b2)) != nullptr;
     }
 
-    pos_x = ggml_new_tensor_1d(ctx_w, GGML_TYPE_I32, n_patch);
-    pos_y = ggml_new_tensor_1d(ctx_w, GGML_TYPE_I32, n_patch);
-
     if (!ok) {
         gguf_free(gf);
         return false;
@@ -256,59 +382,7 @@ bool fm_context::load(
         ggml_backend_tensor_set(dst_list[i], src_list[i]->data, 0, ggml_nbytes(src_list[i]));
     }
 
-    {
-        std::vector<int32_t> x(n_patch), y(n_patch);
-        for (int64_t j = 0; j < n_patch; ++j) {
-            x[j] = (int32_t) (j % pxx);
-            y[j] = (int32_t) (j / pxx);
-        }
-        ggml_backend_tensor_set(pos_x, x.data(), 0, n_patch*sizeof(int32_t));
-        ggml_backend_tensor_set(pos_y, y.data(), 0, n_patch*sizeof(int32_t));
-    }
-
-    // vision patch embedder: conv 16/16, rope, conv 2/2
-    ctx_enc = make_ctx(64u << 20);
-    {
-        ggml_context * c = ctx_enc;
-        in_enc = ggml_new_tensor_3d(c, GGML_TYPE_F32, img_w, img_h, 3);
-        ggml_set_input(in_enc);
-
-        ggml_tensor * x = ggml_conv_2d_direct(c, patch_w, in_enc, p.patch_size, p.patch_size, 0, 0, 1, 1);
-        x = ggml_add(c, x, ggml_reshape_3d(c, patch_b, 1, 1, p.vision_n_embd));
-        x = ggml_gelu_erf(c, x);
-
-        x = ggml_cont(c, ggml_permute(c, x, 1, 2, 0, 3));
-        x = ggml_reshape_3d(c, x, p.vision_n_embd, 1, n_patch);
-
-        const int64_t n_half = p.vision_n_embd/2;
-        ggml_tensor * xa = ggml_view_3d(c, x, n_half, 1, n_patch, x->nb[1], x->nb[2], 0);
-        ggml_tensor * xb = ggml_view_3d(c, x, n_half, 1, n_patch, x->nb[1], x->nb[2], n_half*x->nb[0]);
-
-        xa = ggml_rope_ext(c, xa, pos_x, nullptr, n_half, GGML_ROPE_TYPE_NORMAL, 0,
-                p.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        xb = ggml_rope_ext(c, xb, pos_y, nullptr, n_half, GGML_ROPE_TYPE_NORMAL, 0,
-                p.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-        ggml_tensor * r = ggml_concat(c, xa, xb, 0);
-        r = ggml_reshape_3d(c, r, p.vision_n_embd, pxx, pxy);
-        r = ggml_cont(c, ggml_permute(c, r, 2, 0, 1, 3));
-
-        ggml_tensor * y = ggml_conv_2d_direct(c, dense_w, r, p.merge_size, p.merge_size, 0, 0, 1, 1);
-        y = ggml_add(c, y, ggml_reshape_3d(c, dense_b, 1, 1, p.n_embd));
-
-        out_enc = ggml_cont(c, ggml_permute(c, y, 1, 2, 0, 3));
-        ggml_set_output(out_enc);
-    }
-    if (out_enc->ne[0] != p.n_embd || out_enc->ne[1] != pxx/2 || out_enc->ne[2] != pxy/2) {
-        err = "unexpected vision embedder output shape";
-        gguf_free(gf);
-        return false;
-    }
-    gf_enc = ggml_new_graph_custom(ctx_enc, 4096, false);
-    ggml_build_forward_expand(gf_enc, out_enc);
-    ga_enc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(ga_enc, gf_enc)) {
-        err = "cannot allocate vision embedder graph";
+    if (!enc_gen.build(backend, p, img_w, img_h, patch_w, patch_b, dense_w, dense_b, err)) {
         gguf_free(gf);
         return false;
     }
@@ -414,12 +488,20 @@ bool fm_context::load(
 }
 
 bool fm_context::encode_image(const float * img, float * out, std::string & err) {
-    ggml_backend_tensor_set(in_enc, img, 0, ggml_nbytes(in_enc));
-    if (!run_graph(backend, gf_enc, err)) {
+    return enc_gen.encode(backend, img, out, err);
+}
+
+bool fm_context::encode_ref_image(const float * img, int img_w, int img_h, float * out, std::string & err) {
+    if (!has_und_vision()) {
+        err = "FM sidecar has no understanding vision weights, regenerate it with retag.py";
         return false;
     }
-    ggml_backend_tensor_get(out_enc, out, 0, ggml_nbytes(out_enc));
-    return true;
+
+    fm_vision_encoder enc;
+    if (!enc.build(backend, p, img_w, img_h, patch_w_und, patch_b_und, dense_w_und, dense_b_und, err)) {
+        return false;
+    }
+    return enc.encode(backend, img, out, err);
 }
 
 bool fm_context::embed_cond(float t, float noise_ratio, float * out, std::string & err) {

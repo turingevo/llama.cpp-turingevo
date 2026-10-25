@@ -85,6 +85,12 @@ FM_MAP = {
     "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight":  "vision.dense_embd.weight",
     "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.bias":    "vision.dense_embd.bias",
 
+    # input images are encoded by the understanding branch vision embedder
+    "vision_model.embeddings.patch_embedding.weight":                    "vision_und.patch_embd.weight",
+    "vision_model.embeddings.patch_embedding.bias":                      "vision_und.patch_embd.bias",
+    "vision_model.embeddings.dense_embedding.weight":                    "vision_und.dense_embd.weight",
+    "vision_model.embeddings.dense_embedding.bias":                      "vision_und.dense_embd.bias",
+
     "fm_modules.timestep_embedder.mlp.0.weight":    "timestep.mlp.0.weight",
     "fm_modules.timestep_embedder.mlp.0.bias":      "timestep.mlp.0.bias",
     "fm_modules.timestep_embedder.mlp.2.weight":    "timestep.mlp.2.weight",
@@ -292,8 +298,11 @@ def write_fm(args, reader, writer):
         add_tensor_preserving_bytes(writer, dst, t)
         n += 1
 
-    if n != 16:
+    # 16 without the understanding vision embedder, 20 with it
+    if n not in (16, 20):
         raise ValueError(f"unexpected FM tensor count: {n}")
+    if n == 16:
+        print("  fm: understanding vision embedder not found, image editing will be unavailable", flush=True)
 
 
 def main():
