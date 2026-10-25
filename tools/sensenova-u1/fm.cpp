@@ -204,7 +204,9 @@ bool fm_context::load(
         std::string & err) {
     backend = backend_;
 
-    if (img_w <= 0 || img_h <= 0 || img_w % 32 != 0 || img_h % 32 != 0) {
+    // 0 x 0 loads the weights only, for callers that do not generate images
+    const bool with_image = img_w != 0 || img_h != 0;
+    if (with_image && (img_w <= 0 || img_h <= 0 || img_w % 32 != 0 || img_h % 32 != 0)) {
         err = "image size must be a positive multiple of 32";
         return false;
     }
@@ -258,8 +260,8 @@ bool fm_context::load(
         return false;
     }
 
-    const int64_t pxx = img_w/p.patch_size;
-    const int64_t pxy = img_h/p.patch_size;
+    const int64_t pxx = with_image ? img_w/p.patch_size : 0;
+    const int64_t pxy = with_image ? img_h/p.patch_size : 0;
     const int64_t n_tok = pxx*pxy/(p.merge_size*p.merge_size);
 
     ctx_w = make_ctx(4u << 20);
@@ -382,7 +384,7 @@ bool fm_context::load(
         ggml_backend_tensor_set(dst_list[i], src_list[i]->data, 0, ggml_nbytes(src_list[i]));
     }
 
-    if (!enc_gen.build(backend, p, img_w, img_h, patch_w, patch_b, dense_w, dense_b, err)) {
+    if (with_image && !enc_gen.build(backend, p, img_w, img_h, patch_w, patch_b, dense_w, dense_b, err)) {
         gguf_free(gf);
         return false;
     }
@@ -419,7 +421,7 @@ bool fm_context::load(
         return false;
     }
 
-    if (p.head_conv) {
+    if (with_image && p.head_conv) {
         const int64_t hw = pxx/2;
         const int64_t hh = pxy/2;
 
@@ -461,7 +463,7 @@ bool fm_context::load(
             gguf_free(gf);
             return false;
         }
-    } else {
+    } else if (with_image) {
         ctx_hl = make_ctx(16u << 20);
         {
             ggml_context * c = ctx_hl;

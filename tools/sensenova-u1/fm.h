@@ -121,6 +121,7 @@ struct fm_context {
     ggml_tensor  * in_hl    = nullptr;
     ggml_tensor  * out_hl   = nullptr;
 
+    // 0 x 0 loads the weights only, without the image graphs
     bool load(const std::string & path, ggml_backend_t backend, int img_w, int img_h, std::string & err);
     ~fm_context();
 
