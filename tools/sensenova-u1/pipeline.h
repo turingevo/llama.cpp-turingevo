@@ -93,6 +93,43 @@ struct sensenova_qa_result {
     bool truncated = false;
 };
 
+struct sensenova_interleave_params {
+    std::string prompt;
+    std::string system_prompt; // empty keeps the built-in interleave system message
+
+    int width  = 0; // 0 = auto: follow the first input image, else auto_pixels at 1:1
+    int height = 0;
+    int auto_pixels = 1024*1024;
+    int steps  = 8;
+    int seed   = 42;
+    float shift = 3.0f;
+
+    int max_images     = 3;
+    int max_new_tokens = 4096;
+    bool think = true; // let the model reason, images can then appear inside the think block
+
+    // 0 keeps greedy decoding, the other fields apply only when temperature > 0
+    float temperature    = 0.0f;
+    int   top_k          = 0;
+    float top_p          = 0.95f;
+    float repeat_penalty = 1.0f;
+
+    // per input image, 0 = auto: min(2048^2, 4096^2/n)
+    int input_max_pixels = 0;
+
+    std::vector<sensenova_image_input> images;
+};
+
+struct sensenova_interleave_result {
+    std::string text;       // generated text, "<image>" marks each generated image
+    std::string think_text; // reasoning text, empty when the reply has no think block
+    std::string answer;     // text with the think block removed
+    std::vector<sensenova_result> images;
+    int n_prompt_tokens = 0;
+    int n_generated = 0;
+    bool truncated = false;
+};
+
 std::unique_ptr<sensenova_model> sensenova_model_load(
         const std::string & model_path,
         const std::string & fm_path,
@@ -111,4 +148,12 @@ bool sensenova_understand(
         sensenova_model & model,
         const sensenova_qa_params & params,
         sensenova_qa_result & out,
+        std::string & err);
+
+// interleaved text and image generation: the model emits text and <img> tags,
+// each tag is replaced by a generated image that the model then reads back
+bool sensenova_interleave(
+        sensenova_model & model,
+        const sensenova_interleave_params & params,
+        sensenova_interleave_result & out,
         std::string & err);

@@ -30,6 +30,18 @@ static const char * SYSTEM_MESSAGE_FOR_GEN =
     "the user's description, not the language of the prompt. If no language is specified, use the "
     "user's input language.";
 
+// system prompt used by the interleave branch of the reference implementation
+static const char * SYSTEM_MESSAGE_FOR_INTERLEAVE =
+    "You are a multimodal assistant capable of reasoning with both text and images. You support "
+    "two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> "
+    "block and place all reasoning inside it. You MUST interleave text with generated images using "
+    "tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and "
+    "may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, "
+    "directly provide the answer without reasoning. Do not use tags like <image1>, <image2>; "
+    "present any images naturally alongside the text.\n\nAfter the think block, always provide a "
+    "concise, user-facing final answer. The answer may include text, images, or both. Match the "
+    "user's language in both reasoning and the final answer.";
+
 static const int GRID = 32;
 
 // deterministic normal distribution, independent of the standard library
@@ -152,6 +164,31 @@ static std::string build_plain_prompt(const std::string & user) {
 // single turn chat prompt for visual understanding
 static std::string build_chat_prompt(const std::string & question) {
     return "<|im_start|>user\n" + question + "<|im_end|>\n<|im_start|>assistant\n";
+}
+
+// chat prompt for interleave, the model decides when to emit <img>
+static std::string build_interleave_prompt(const std::string & system, const std::string & user, bool think) {
+    std::string q;
+    q += "<|im_start|>system\n";
+    q += system;
+    q += "<|im_end|>\n";
+    q += "<|im_start|>user\n";
+    q += user;
+    q += "<|im_end|>\n";
+    q += "<|im_start|>assistant\n";
+    if (!think) {
+        q += "<think>\n\n</think>\n\n";
+    }
+    return q;
+}
+
+// the interleave prompt prepends missing placeholders without labels
+static std::string add_missing_placeholders_plain(const std::string & prompt, int n_images) {
+    std::string pre;
+    for (int i = count_placeholders(prompt); i < n_images; ++i) {
+        pre += "<image>\n";
+    }
+    return pre + prompt;
 }
 
 // one token of a prefix, with its M-RoPE position
@@ -409,23 +446,29 @@ struct sampler_deleter {
 };
 
 // null keeps greedy decoding, which is what the vendor defaults to
-static std::unique_ptr<llama_sampler, sampler_deleter> make_sampler(const sensenova_qa_params & p, int n_vocab) {
-    if (p.temperature <= 0.0f) {
+static std::unique_ptr<llama_sampler, sampler_deleter> make_sampler(
+        float temperature,
+        int top_k,
+        float top_p,
+        float repeat_penalty,
+        int seed,
+        int n_vocab) {
+    if (temperature <= 0.0f) {
         return nullptr;
     }
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (p.repeat_penalty != 1.0f) {
+    if (repeat_penalty != 1.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
-                n_vocab, 64, p.repeat_penalty, 0.0f, 0.0f));
+                n_vocab, 64, repeat_penalty, 0.0f, 0.0f));
     }
-    if (p.top_k > 0) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(p.top_k));
+    if (top_k > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
     }
-    if (p.top_p < 1.0f) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(p.top_p, 1));
+    if (top_p < 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
     }
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(p.temperature));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist((uint32_t) p.seed));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist((uint32_t) seed));
     return std::unique_ptr<llama_sampler, sampler_deleter>(smpl);
 }
 
@@ -664,6 +707,90 @@ static bool run_head(
         }
     }
     return true;
+}
+
+// one denoising step for one sequence: generation pass, then drop the KV rows
+static bool predict_velocity(
+        fm_context & fm,
+        llama_context * ctx,
+        llama_seq_id seq,
+        llama_pos t_img,
+        int token_h,
+        int token_w,
+        int width,
+        int height,
+        const float * image_embeds,
+        const float * img,
+        float denom,
+        std::vector<float> & hidden,
+        std::vector<float> & x_pred,
+        std::vector<float> & v,
+        std::string & err) {
+    if (!decode_image(ctx, seq, t_img, token_h, token_w, image_embeds, hidden.data(), fm.p.n_embd)) {
+        err = "generation pass decode failed";
+        return false;
+    }
+    llama_memory_seq_rm(llama_get_memory(ctx), seq, t_img, -1);
+    if (!run_head(fm, hidden.data(), x_pred, height, width, err)) {
+        return false;
+    }
+    for (size_t i = 0; i < v.size(); ++i) {
+        v[i] = (x_pred[i] - img[i])/denom;
+    }
+    return true;
+}
+
+// [-1, 1] channel-major image -> patch embedder layout, ImageNet normalized
+static void gen_to_fm_input(const std::vector<float> & img, std::vector<float> & out, int w, int h) {
+    static const float mean[3] = { 0.485f, 0.456f, 0.406f };
+    static const float std_[3] = { 0.229f, 0.224f, 0.225f };
+    out.resize((size_t) 3*w*h);
+    for (int c = 0; c < 3; ++c) {
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const float v = img[(size_t) c*w*h + (size_t) y*w + x]*0.5f + 0.5f;
+                out[(size_t) x + (size_t) w*y + (size_t) w*h*c] = (v - mean[c])/std_[c];
+            }
+        }
+    }
+}
+
+static void to_rgb(const std::vector<float> & img, int width, int height, std::vector<uint8_t> & rgb) {
+    rgb.resize((size_t) 3*width*height);
+    for (int c = 0; c < 3; ++c) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float v = img[(size_t) c*width*height + (size_t) y*width + x]*0.5f + 0.5f;
+                v = std::min(1.0f, std::max(0.0f, v));
+                rgb[(size_t) (y*width + x)*3 + c] = (uint8_t) lroundf(v*255.0f);
+            }
+        }
+    }
+}
+
+static void build_timesteps(int steps, float shift, std::vector<float> & timesteps) {
+    timesteps.resize((size_t) steps + 1);
+    for (int i = 0; i <= steps; ++i) {
+        const float t = (float) i/steps;
+        float sigma = 1.0f - t;
+        sigma = shift*sigma/(1.0f + (shift - 1.0f)*sigma);
+        timesteps[(size_t) i] = 1.0f - sigma;
+    }
+}
+
+static float noise_scale_for(const fm_params & p, int width, int height) {
+    float noise_scale = p.noise_scale;
+    if (p.noise_scale_mode == "resolution" || p.noise_scale_mode == "dynamic" ||
+        p.noise_scale_mode == "dynamic_sqrt") {
+        const int n_patch = (height/16)*(width/16);
+        const float scale = sqrtf((float) n_patch/(float) (p.merge_size*p.merge_size)/
+                                  (float) p.noise_scale_base_seq_len);
+        noise_scale = scale*p.noise_scale;
+        if (p.noise_scale_mode == "dynamic_sqrt") {
+            noise_scale = sqrtf(noise_scale);
+        }
+    }
+    return std::min(noise_scale, p.noise_scale_max);
 }
 
 // clamp the CFG result to the conditional norm, matching the reference
@@ -949,7 +1076,6 @@ bool sensenova_generate(
     const int token_h = height/GRID;
     const int token_w = width/GRID;
     const int n_tokens = token_h*token_w;
-    const int n_patch  = (height/16)*(width/16);
 
     const llama_vocab * vocab = llama_model_get_vocab(model.model);
     const int n_embd = model.n_embd;
@@ -1081,30 +1207,11 @@ bool sensenova_generate(
     llama_set_gen_pass(ctx, true);
     llama_set_embeddings(ctx, true);
 
-    llama_memory_t mem = llama_get_memory(ctx);
-
-    float noise_scale = fm.p.noise_scale;
-    if (fm.p.noise_scale_mode == "resolution" || fm.p.noise_scale_mode == "dynamic" ||
-        fm.p.noise_scale_mode == "dynamic_sqrt") {
-        const float scale = sqrtf((float) n_patch/(float) (fm.p.merge_size*fm.p.merge_size)/
-                                  (float) fm.p.noise_scale_base_seq_len);
-        noise_scale = scale*fm.p.noise_scale;
-        if (fm.p.noise_scale_mode == "dynamic_sqrt") {
-            noise_scale = sqrtf(noise_scale);
-        }
-    }
-    if (noise_scale > fm.p.noise_scale_max) {
-        noise_scale = fm.p.noise_scale_max;
-    }
+    const float noise_scale = noise_scale_for(fm.p, width, height);
 
     // timestep schedule
-    std::vector<float> timesteps(p.steps + 1);
-    for (int i = 0; i <= p.steps; ++i) {
-        const float t = (float) i/p.steps;
-        float sigma = 1.0f - t;
-        sigma = p.shift*sigma/(1.0f + (p.shift - 1.0f)*sigma);
-        timesteps[i] = 1.0f - sigma;
-    }
+    std::vector<float> timesteps;
+    build_timesteps(p.steps, p.shift, timesteps);
 
     rng_normal rng((uint64_t) p.seed);
     std::vector<float> img((size_t) 3*width*height);
@@ -1164,17 +1271,8 @@ bool sensenova_generate(
         const float denom = std::max(1.0f - t, 0.05f);
 
         auto predict = [&](llama_seq_id seq, llama_pos t_img, std::vector<float> & hid, std::vector<float> & v) -> bool {
-            if (!decode_image(ctx, seq, t_img, token_h, token_w, image_embeds.data(), hid.data(), n_embd)) {
-                return false;
-            }
-            llama_memory_seq_rm(mem, seq, t_img, -1);
-            if (!run_head(fm, hid.data(), x_pred, height, width, err)) {
-                return false;
-            }
-            for (size_t i = 0; i < v.size(); ++i) {
-                v[i] = (x_pred[i] - img[i])/denom;
-            }
-            return true;
+            return predict_velocity(fm, ctx, seq, t_img, token_h, token_w, width, height,
+                    image_embeds.data(), img.data(), denom, hid, x_pred, v, err);
         };
 
         if (!predict(seq_cond, cond_img_t, hidden, v_cond)) {
@@ -1233,16 +1331,7 @@ bool sensenova_generate(
     // normalized [-1, 1] space -> 8-bit RGB
     out.width  = width;
     out.height = height;
-    out.rgb.resize((size_t) 3*width*height);
-    for (int c = 0; c < 3; ++c) {
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                float v = img[(size_t) c*width*height + (size_t) y*width + x]*0.5f + 0.5f;
-                v = std::min(1.0f, std::max(0.0f, v));
-                out.rgb[(size_t) (y*width + x)*3 + c] = (uint8_t) lroundf(v*255.0f);
-            }
-        }
-    }
+    to_rgb(img, width, height, out.rgb);
     return true;
 }
 
@@ -1347,7 +1436,8 @@ bool sensenova_understand(
         return false;
     }
 
-    auto smpl = make_sampler(p, llama_vocab_n_tokens(vocab));
+    auto smpl = make_sampler(p.temperature, p.top_k, p.top_p, p.repeat_penalty, p.seed,
+            llama_vocab_n_tokens(vocab));
 
     std::vector<llama_token> ids;
     llama_pos t = spec.max_t;
@@ -1362,5 +1452,301 @@ bool sensenova_understand(
     out.n_prompt_tokens = (int) spec.items.size();
     out.n_generated = (int) ids.size();
     out.truncated = out.n_generated >= p.max_new_tokens;
+    return true;
+}
+
+bool sensenova_interleave(
+        sensenova_model & model,
+        const sensenova_interleave_params & p,
+        sensenova_interleave_result & out,
+        std::string & err) {
+    if (p.prompt.empty()) {
+        err = "prompt is empty";
+        return false;
+    }
+    if (p.steps <= 0) {
+        err = "steps must be positive";
+        return false;
+    }
+    if (p.max_images <= 0) {
+        err = "max_images must be positive";
+        return false;
+    }
+    if (p.max_new_tokens <= 0) {
+        err = "max_new_tokens must be positive";
+        return false;
+    }
+
+    const int n_images = (int) p.images.size();
+    const int min_pixels = 512*512;
+
+    std::vector<sensenova_image> inputs;
+    if (!prepare_input_images(p.images, p.input_max_pixels, inputs, err)) {
+        return false;
+    }
+
+    // resolve the output size: explicit, first input aspect, or 1024x1024
+    int width  = p.width;
+    int height = p.height;
+    if (width == 0 && height == 0) {
+        if (n_images > 0) {
+            const int target = p.auto_pixels;
+            if (target < min_pixels) {
+                err = "auto_pixels must be at least 512*512";
+                return false;
+            }
+            if (!image_plan_size(inputs[0].w, inputs[0].h, target, target, width, height, err)) {
+                err = "cannot derive the output size: " + err;
+                return false;
+            }
+        } else {
+            width  = 1024;
+            height = 1024;
+        }
+    } else if (width <= 0 || height <= 0) {
+        err = "width and height must be set together";
+        return false;
+    }
+    if (width % GRID != 0 || height % GRID != 0) {
+        err = "width and height must be positive multiples of 32";
+        return false;
+    }
+
+    const int token_h = height/GRID;
+    const int token_w = width/GRID;
+    const int n_tokens = token_h*token_w;
+
+    const llama_vocab * vocab = llama_model_get_vocab(model.model);
+    const int n_embd = model.n_embd;
+
+    if (!model.load_fm(width, height, err)) {
+        err = "cannot load FM sidecar: " + err;
+        return false;
+    }
+    fm_context & fm = *model.fm;
+    if (!fm.has_und_vision()) {
+        err = "the FM sidecar has no vision weights, regenerate it with retag.py";
+        return false;
+    }
+
+    std::vector<std::vector<float>> img_embeds;
+    std::vector<std::pair<int, int>> img_grid; // token_h, token_w
+    std::vector<int> img_tok;
+    if (!encode_input_images(model, inputs, img_embeds, img_grid, img_tok, err)) {
+        return false;
+    }
+
+    if (count_placeholders(p.prompt) > n_images) {
+        err = "the prompt has more <image> placeholders than input images";
+        return false;
+    }
+
+    const std::string question = expand_images(add_missing_placeholders_plain(p.prompt, n_images), img_tok);
+    const std::string system = p.system_prompt.empty() ? SYSTEM_MESSAGE_FOR_INTERLEAVE : p.system_prompt;
+
+    prefix_spec spec;
+    if (!build_prefix(vocab, build_interleave_prompt(system, question, p.think), img_grid, spec, err)) {
+        err = "prompt: " + err;
+        return false;
+    }
+
+    llama_token img_start = 0;
+    llama_token img_end   = 0;
+    llama_token eos       = 0;
+    if (!token_id(vocab, "<img>", img_start) || !token_id(vocab, "</img>", img_end)) {
+        err = "cannot find the image tokens in the vocabulary";
+        return false;
+    }
+    if (!token_id(vocab, "<|im_end|>", eos)) {
+        err = "cannot find the end token in the vocabulary";
+        return false;
+    }
+
+    // largest batch: one prefix run, one input image block, or one generated image block
+    uint32_t n_batch = (uint32_t) spec.items.size();
+    n_batch = std::max<uint32_t>(n_batch, (uint32_t) n_tokens);
+    for (int n : img_tok) {
+        n_batch = std::max<uint32_t>(n_batch, (uint32_t) n);
+    }
+
+    const uint32_t n_ctx = (uint32_t) spec.items.size() + (uint32_t) p.max_new_tokens +
+            (uint32_t) p.max_images * (uint32_t) (n_tokens + 2) + 8;
+
+    fprintf(stderr, "interleave: prompt %zu tokens, image %dx%d (%d tokens), steps %d, max images %d, text budget %d%s\n",
+            spec.items.size(), width, height, n_tokens, p.steps, p.max_images, p.max_new_tokens,
+            p.think ? ", think" : "");
+
+    auto ctx_holder = create_context(model, n_ctx, std::max<uint32_t>(n_batch, 1), 1, true, err);
+    if (!ctx_holder) {
+        return false;
+    }
+    llama_context * ctx = ctx_holder.get();
+
+    const llama_seq_id seq = 0;
+    if (!decode_prefix(ctx, seq, spec, img_embeds, n_embd, true)) {
+        err = "prompt decode failed";
+        return false;
+    }
+
+    auto smpl = make_sampler(p.temperature, p.top_k, p.top_p, p.repeat_penalty, p.seed,
+            llama_vocab_n_tokens(vocab));
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    auto sample = [&]() -> llama_token {
+        if (smpl != nullptr) {
+            return llama_sampler_sample(smpl.get(), ctx, -1);
+        }
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        if (logits == nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return argmax_token(logits, n_vocab);
+    };
+
+    const float noise_scale = noise_scale_for(fm.p, width, height);
+    const float noise_ratio = noise_scale/fm.p.noise_scale_max;
+
+    std::vector<float> timesteps;
+    build_timesteps(p.steps, p.shift, timesteps);
+
+    rng_normal rng((uint64_t) p.seed);
+
+    std::vector<float> image_embeds((size_t) n_tokens*n_embd);
+    std::vector<float> ts_emb(n_embd);
+    std::vector<float> hidden((size_t) n_tokens*n_embd);
+    std::vector<float> x_pred;
+    std::vector<float> v((size_t) 3*width*height);
+    std::vector<float> img((size_t) 3*width*height);
+    std::vector<float> img_whc((size_t) 3*width*height);
+    std::vector<float> und_whc((size_t) 3*width*height);
+    std::vector<float> und_embeds((size_t) n_tokens*n_embd);
+    std::vector<prefix_item> append_items((size_t) n_tokens);
+    std::vector<llama_token> text_ids;
+
+    llama_pos t = spec.max_t;
+    int n_generated = 0;
+    bool truncated = false;
+
+    llama_token next = sample();
+    while (true) {
+        if (next == LLAMA_TOKEN_NULL) {
+            err = "no logits after the prompt pass";
+            return false;
+        }
+        if (next == eos) {
+            break;
+        }
+
+        if (next == img_start) {
+            if ((int) out.images.size() >= p.max_images) {
+                break;
+            }
+
+            const int img_idx = (int) out.images.size();
+            fprintf(stderr, "image %d/%d: %dx%d, %d steps\n", img_idx + 1, p.max_images, width, height, p.steps);
+
+            ++t;
+            if (!decode_one_token(ctx, seq, img_start, t)) {
+                err = "cannot append the image start";
+                return false;
+            }
+
+            for (size_t i = 0; i < img.size(); ++i) {
+                img[i] = noise_scale*rng.next();
+            }
+
+            llama_set_causal_attn(ctx, false);
+            llama_set_gen_pass(ctx, true);
+            llama_set_embeddings(ctx, true);
+
+            for (int step = 0; step < p.steps; ++step) {
+                const float t_cur  = timesteps[(size_t) step];
+                const float t_next = timesteps[(size_t) step + 1];
+
+                to_whc(img, img_whc, width, height);
+                if (!fm.encode_image(img_whc.data(), image_embeds.data(), err)) {
+                    err = "vision encode failed: " + err;
+                    return false;
+                }
+                if (!fm.embed_cond(t_cur, noise_ratio, ts_emb.data(), err)) {
+                    err = "timestep embedding failed: " + err;
+                    return false;
+                }
+                for (int j = 0; j < n_tokens; ++j) {
+                    float * e = image_embeds.data() + (size_t) j*n_embd;
+                    for (int c = 0; c < n_embd; ++c) {
+                        e[c] += ts_emb[c];
+                    }
+                }
+
+                const float denom = std::max(1.0f - t_cur, 0.05f);
+                if (!predict_velocity(fm, ctx, seq, t + 1, token_h, token_w, width, height,
+                        image_embeds.data(), img.data(), denom, hidden, x_pred, v, err)) {
+                    err = "image generation failed: " + err;
+                    return false;
+                }
+
+                const float dt = t_next - t_cur;
+                for (size_t i = 0; i < img.size(); ++i) {
+                    img[i] += dt*v[i];
+                }
+                fprintf(stderr, "  step %d/%d: t=%.4f -> %.4f\n", step + 1, p.steps, t_cur, t_next);
+            }
+
+            sensenova_result res;
+            res.width  = width;
+            res.height = height;
+            to_rgb(img, width, height, res.rgb);
+            out.images.push_back(std::move(res));
+
+            // the model reads the generated image back as an input image
+            gen_to_fm_input(img, und_whc, width, height);
+            if (!fm.encode_ref_image(und_whc.data(), width, height, und_embeds.data(), err)) {
+                err = "cannot re-encode the generated image: " + err;
+                return false;
+            }
+            for (int i = 0; i < n_tokens; ++i) {
+                prefix_item & it = append_items[(size_t) i];
+                it.t = t + 1;
+                it.h = i/token_w;
+                it.w = i%token_w;
+            }
+            if (!decode_embd_run(ctx, seq, und_embeds.data(), append_items.data(), n_tokens)) {
+                err = "cannot append the generated image";
+                return false;
+            }
+            if (!decode_one_token(ctx, seq, img_end, t + 2)) {
+                err = "cannot append the image end";
+                return false;
+            }
+            t += 2;
+
+            out.text += detokenize(vocab, text_ids);
+            text_ids.clear();
+            out.text += "<image>";
+
+            next = sample();
+            continue;
+        }
+
+        if (n_generated >= p.max_new_tokens) {
+            truncated = true;
+            break;
+        }
+        text_ids.push_back(next);
+        ++n_generated;
+        ++t;
+        if (!decode_one_token(ctx, seq, next, t)) {
+            err = "token decode failed";
+            return false;
+        }
+        next = sample();
+    }
+
+    out.text += detokenize(vocab, text_ids);
+    split_think(out.text, out.think_text, out.answer);
+    out.n_prompt_tokens = (int) spec.items.size();
+    out.n_generated = n_generated;
+    out.truncated = truncated;
     return true;
 }

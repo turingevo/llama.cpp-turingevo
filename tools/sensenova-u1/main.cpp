@@ -25,6 +25,7 @@ struct gen_args {
     float shift = 3.0f;
     std::string cfg_norm = "none";
     bool think = false;
+    bool no_think = false;
     bool print_think = false;
     std::string think_output;
     int max_think_tokens = 1024;
@@ -37,6 +38,8 @@ struct gen_args {
     int top_k = 0;
     float top_p = 0.95f;
     float repeat_penalty = 1.0f;
+    bool interleave = false;
+    int max_images = 3;
 };
 
 static void print_usage(const char * prog) {
@@ -58,18 +61,21 @@ static void print_usage(const char * prog) {
             "      --shift F        timestep shift (default: 3.0)\n"
             "      --seed N         random seed (default: 42)\n"
             "      --think          generate a think block before denoising\n"
+            "      --no-think       disable thinking in --interleave mode (on by default there)\n"
             "      --max-think-tokens N  think budget (default: 1024)\n"
             "      --print-think    print the think text to stdout\n"
             "      --think-output PATH   save the think text to a file\n"
             "      --input-max-pixels N  per input image budget (default: auto)\n"
             "      --auto-pixels N  output pixels when width and height are auto (default: 1048576)\n"
             "      --vqa            answer the prompt as a question about -i images\n"
-            "      --max-new-tokens N    answer budget in --vqa mode (default: 1024)\n"
-            "      --answer-output PATH  save the --vqa answer to a file\n"
-            "      --temperature F  --vqa sampling temperature, 0 = greedy (default: 0)\n"
-            "      --top-k N        --vqa top-k sampling, 0 = off (default: 0)\n"
-            "      --top-p F        --vqa nucleus sampling (default: 0.95)\n"
-            "      --repeat-penalty F    --vqa repetition penalty (default: 1.0)\n"
+            "      --interleave     generate text and images interleaved, text goes to stdout\n"
+            "      --max-images N   --interleave image budget (default: 3)\n"
+            "      --max-new-tokens N    answer budget in --vqa mode, text budget in --interleave (default: 1024)\n"
+            "      --answer-output PATH  save the --vqa / --interleave text to a file\n"
+            "      --temperature F  --vqa / --interleave temperature, 0 = greedy (default: 0)\n"
+            "      --top-k N        --vqa / --interleave top-k sampling, 0 = off (default: 0)\n"
+            "      --top-p F        --vqa / --interleave nucleus sampling (default: 0.95)\n"
+            "      --repeat-penalty F    --vqa / --interleave repetition penalty (default: 1.0)\n"
             "  -ngl N               layers to offload to GPU (default: 999)\n"
             "  -t, --threads N      CPU threads (default: number of cores)\n",
             prog);
@@ -114,6 +120,8 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
             const char * v = next(arg.c_str()); if (!v) return false; a.seed = atoi(v);
         } else if (arg == "--think") {
             a.think = true;
+        } else if (arg == "--no-think") {
+            a.no_think = true;
         } else if (arg == "--max-think-tokens") {
             const char * v = next(arg.c_str()); if (!v) return false; a.max_think_tokens = atoi(v);
         } else if (arg == "--print-think") {
@@ -126,6 +134,10 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
             const char * v = next(arg.c_str()); if (!v) return false; a.auto_size_pixels = atoi(v);
         } else if (arg == "--vqa") {
             a.vqa = true;
+        } else if (arg == "--interleave") {
+            a.interleave = true;
+        } else if (arg == "--max-images") {
+            const char * v = next(arg.c_str()); if (!v) return false; a.max_images = atoi(v);
         } else if (arg == "--max-new-tokens") {
             const char * v = next(arg.c_str()); if (!v) return false; a.max_new_tokens = atoi(v);
         } else if (arg == "--answer-output") {
@@ -163,12 +175,33 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
         fprintf(stderr, "error: max new tokens must be positive\n");
         return false;
     }
-    if (a.vqa && (a.temperature < 0.0f || a.top_k < 0 || a.top_p <= 0.0f || a.top_p > 1.0f ||
-                  a.repeat_penalty <= 0.0f)) {
+    if (a.vqa && a.interleave) {
+        fprintf(stderr, "error: --vqa and --interleave are mutually exclusive\n");
+        return false;
+    }
+    if (a.interleave && (a.max_new_tokens <= 0 || a.max_images <= 0)) {
+        fprintf(stderr, "error: max new tokens and max images must be positive\n");
+        return false;
+    }
+    if ((a.vqa || a.interleave) && (a.temperature < 0.0f || a.top_k < 0 || a.top_p <= 0.0f ||
+                                    a.top_p > 1.0f || a.repeat_penalty <= 0.0f)) {
         fprintf(stderr, "error: invalid sampling parameters\n");
         return false;
     }
     return true;
+}
+
+// out.png -> out_1.png, out_2.png
+static std::string numbered_path(const std::string & path, int idx) {
+    if (idx == 0) {
+        return path;
+    }
+    const size_t dot   = path.find_last_of('.');
+    const size_t slash = path.find_last_of('/');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+        return path + "_" + std::to_string(idx);
+    }
+    return path.substr(0, dot) + "_" + std::to_string(idx) + path.substr(dot);
 }
 
 int main(int argc, char ** argv) {
@@ -239,6 +272,77 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "prompt tokens: %d, answer tokens: %d%s\n", qres.n_prompt_tokens, qres.n_generated,
                 qres.truncated ? " (truncated)" : "");
+        return 0;
+    }
+
+    if (a.interleave) {
+        if (a.cfg != 1.0f || a.img_cfg != 1.0f || a.cfg_norm != "none") {
+            fprintf(stderr, "warning: --cfg, --img-cfg and --cfg-norm are ignored in --interleave mode\n");
+        }
+
+        sensenova_interleave_params ip;
+        ip.prompt = a.prompt;
+        ip.width  = a.width;
+        ip.height = a.height;
+        ip.auto_pixels = a.auto_size_pixels;
+        ip.steps  = a.steps;
+        ip.seed   = a.seed;
+        ip.shift  = a.shift;
+        ip.max_images     = a.max_images;
+        ip.max_new_tokens = a.max_new_tokens;
+        ip.think  = !a.no_think;
+        ip.temperature    = a.temperature;
+        ip.top_k          = a.top_k;
+        ip.top_p          = a.top_p;
+        ip.repeat_penalty = a.repeat_penalty;
+        ip.input_max_pixels = a.input_max_pixels;
+        for (const std::string & path : a.images) {
+            sensenova_image_input in;
+            in.path = path;
+            ip.images.push_back(std::move(in));
+        }
+
+        sensenova_interleave_result ires;
+        if (!sensenova_interleave(*model, ip, ires, err)) {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+
+        if (a.print_think && !ires.think_text.empty()) {
+            printf("--- think ---\n%s\n--- think end ---\n", ires.think_text.c_str());
+        }
+        if (!a.think_output.empty()) {
+            std::ofstream f(a.think_output);
+            if (!f) {
+                fprintf(stderr, "error: cannot write %s\n", a.think_output.c_str());
+                return 1;
+            }
+            f << ires.think_text;
+        }
+
+        printf("%s\n", ires.text.c_str());
+        if (!a.answer_output.empty()) {
+            std::ofstream f(a.answer_output);
+            if (!f) {
+                fprintf(stderr, "error: cannot write %s\n", a.answer_output.c_str());
+                return 1;
+            }
+            f << ires.text << '\n';
+        }
+
+        for (size_t i = 0; i < ires.images.size(); ++i) {
+            const std::string path = numbered_path(a.output, (int) i);
+            if (!png_write_rgb(path, ires.images[i].rgb.data(), ires.images[i].width, ires.images[i].height, err)) {
+                fprintf(stderr, "error: cannot write %s: %s\n", path.c_str(), err.c_str());
+                return 1;
+            }
+            fprintf(stderr, "wrote %s\n", path.c_str());
+        }
+        if (ires.images.empty()) {
+            fprintf(stderr, "warning: no image was generated, raise --max-new-tokens\n");
+        }
+        fprintf(stderr, "prompt tokens: %d, text tokens: %d, images: %d%s\n", ires.n_prompt_tokens,
+                ires.n_generated, (int) ires.images.size(), ires.truncated ? " (truncated)" : "");
         return 0;
     }
 
