@@ -1,5 +1,9 @@
 # llama.cpp
 
+> **TuringEvo 发行版**：在官方 llama.cpp 基础上新增 SenseNova-U1 工具链（权重转换、命令行推理、OpenAI 兼容服务端、图文交错生成）。官方模型与后端未做裁剪，可随上游持续合并。
+>
+> [官网](https://turingevo.com/) · [API](https://api.turingevo.com/) · [博客](https://turingevo.com/blog/) · [GitHub](https://github.com/turingevo) · [Hugging Face](https://huggingface.co/turingevo) · [ModelScope](https://www.modelscope.cn/profile/TuringEvo)
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
@@ -16,6 +20,48 @@
 [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
+
+## TuringEvo 发行版说明
+
+本仓库是 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 的增量分支，默认分支 `turingevo`。上游代码保持原样，新增内容全部放在独立目录，合并上游时无需改动已有模型。
+
+| 组件 | 产物 | 作用 |
+|-|-|-|
+| `tools/sensenova-u1/` | `llama-sensenova-cli` | 文生图、图像编辑、单轮视觉问答、图文交错生成 |
+| `tools/sensenova-u1/convert_sensenova.py` | - | safetensors 转 GGUF，输出 LM 主模型与 FM sidecar |
+| `tools/sensenova-u1/retag.py` | - | 把厂商 GGUF 的张量名与架构名改写为 llama.cpp 布局 |
+| `tools/sensenova-server/` | `llama-sensenova-server` | OpenAI 兼容协议与私有协议服务端 |
+
+构建：
+
+```bash
+cmake -B build -DGGML_CUDA=ON
+cmake --build build -j"$(nproc)" --target llama-sensenova-cli llama-sensenova-server
+```
+
+转换与运行：
+
+```bash
+# safetensors -> GGUF
+python tools/sensenova-u1/convert_sensenova.py --src /path/to/SenseNova-U1 --out sn-u1.gguf --out-fm sn-u1-fm.gguf
+
+# 命令行：文生图
+./build/bin/llama-sensenova-cli -m sn-u1.gguf --fm sn-u1-fm.gguf -p "a cat on the moon" -o out.png
+
+# 服务端
+./build/bin/llama-sensenova-server -m sn-u1.gguf --fm sn-u1-fm.gguf --host 0.0.0.0 --port 8024
+```
+
+服务端端点：`GET /v1/models`、`POST /generate`、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/infographic/generate`、`POST /v1/interleave/generate`、`GET /images/{file}`、`GET /health`、`GET /props`。
+
+同步上游：
+
+```bash
+git fetch upstream
+git switch turingevo
+git merge upstream/master
+git push
+```
 
 ## Quick start
 
@@ -132,3 +178,43 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+----
+
+## 关于
+
+| | | |
+|-|-|-|
+| API | https://api.turingevo.com/ | 全球顶级旗舰模型，抵至1.4折 |
+| 网站 | https://turingevo.com/ | google NotebookLM 国产版本 |
+| 博客 | https://turingevo.com/blog/ | 日常技术分享 |
+| GitHub 组织 | https://github.com/turingevo | 项目分享 |
+| Hugging Face | https://huggingface.co/turingevo | 模型分享 |
+| Model Scope | https://www.modelscope.cn/profile/TuringEvo | 模型分享 |
+
+## 联系方式
+
+| | |
+|-|-|
+| QQ群 | 873673497 |
+| 邮箱 | wmx@turingevo.com |
+
+Artificial intelligence, large language models, deep learning, reinforcement learning, machine vision, speech recognition, agents
+
+## About
+
+| | | |
+|-|-|-|
+| API | https://api.turingevo.com/ | World-class flagship models, as low as 14% of the original price (up to 86% off) |
+| Website | https://turingevo.com/ | A China-local version of Google NotebookLM |
+| Blog | https://turingevo.com/blog/ | Daily tech sharing |
+| GitHub Org | https://github.com/turingevo | Project sharing |
+| Hugging Face | https://huggingface.co/turingevo | Model sharing |
+| ModelScope | https://www.modelscope.cn/profile/TuringEvo | Model sharing |
+
+## Contact
+
+| | |
+|-|-|
+| QQ Group | 873673497 |
+| Email | wmx@turingevo.com |
