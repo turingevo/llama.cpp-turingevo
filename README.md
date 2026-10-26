@@ -18,7 +18,7 @@
 
 ## TuringEvo 发行版说明
 
-本仓库是 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 的增量分支，默认分支 `turingevo`。上游代码保持原样，新增内容全部放在独立目录，合并上游时无需改动已有模型。
+本仓库是 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 的增量分支，默认分支 `turingevo`。上游代码保持原样，新增内容按 llama.cpp 既有布局落位（`src/models/`、`conversion/`、`tools/`），文档与脚本另放仓库根的 [`turingevo/`](turingevo/) 目录，不参与构建。
 
 | 组件 | 产物 | 作用 |
 |-|-|-|
@@ -26,6 +26,18 @@
 | `tools/sensenova-u1/convert_sensenova.py` | - | safetensors 转 GGUF，输出 LM 主模型与 FM sidecar |
 | `tools/sensenova-u1/retag.py` | - | 把厂商 GGUF 的张量名与架构名改写为 llama.cpp 布局 |
 | `tools/sensenova-server/` | `llama-sensenova-server` | OpenAI 兼容协议与私有协议服务端 |
+
+### 配套目录 `turingevo/`
+
+| 路径 | 内容 |
+|-|-|
+| [`turingevo/sensenova/`](turingevo/sensenova/) | SenseNova 系列文档、CLI 与客户端脚本、prompt 样例、ModelScope 模型卡 |
+| [`turingevo/shared/`](turingevo/shared/) | 跨模型脚本：编译、量化、压测、部署、embedding / reranker 服务 |
+| [`turingevo/docs/`](turingevo/docs/) | 编译目标与可执行文件说明、同步上游流程 |
+| [`turingevo/android/`](turingevo/android/) | Android NDK 交叉编译脚本 |
+| [`turingevo/README.md`](turingevo/README.md) | 目录总览，以及新增模型的登记约定 |
+
+本地输出写在 `turingevo/out/`，不入库。
 
 构建：
 
