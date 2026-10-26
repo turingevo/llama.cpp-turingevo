@@ -1,14 +1,14 @@
 # llama.cpp
 
-> **TuringEvo 发行版**：在官方 llama.cpp 基础上新增 SenseNova-U1 工具链（权重转换、命令行推理、OpenAI 兼容服务端、图文交错生成）。官方模型与后端未做裁剪，可随上游持续合并。
->
-> [官网](https://turingevo.com/) · [API](https://api.turingevo.com/) · [博客](https://turingevo.com/blog/) · [GitHub](https://github.com/turingevo) · [Hugging Face](https://huggingface.co/turingevo) · [ModelScope](https://www.modelscope.cn/profile/TuringEvo)
-
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
 
 <b>LLM inference in C/C++</b>
+
+<b>TuringEvo 发行版</b> · 新增 SenseNova-U1 工具链（权重转换 / 命令行 / OpenAI 兼容服务端 / 图文交错生成）
+
+[官网](https://turingevo.com/) · [API](https://api.turingevo.com/) · [博客](https://turingevo.com/blog/) · [GitHub](https://github.com/turingevo) · [Hugging Face](https://huggingface.co/turingevo) · [ModelScope](https://www.modelscope.cn/profile/TuringEvo)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
