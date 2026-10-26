@@ -15,6 +15,9 @@
   Q5_K_M（12.70 GiB），出图 sha256 与现有基线相同。
 - 不加 override 的 stock Q5_K_M（11.66 GiB）也能用，但配方与 原厂 不同，
   出图会变。差异集中在 86 个张量，明细见第 4 节。
+- stock 档位已产出三个：Q5_K_M（11.66 GiB）、Q6_K（13.34 GiB）、
+  Q8_0（17.28 GiB），结构一致（590 个权重 + 338 个 F32 norm），
+  任意档位共用同一个 FM sidecar。
 
 ---
 
@@ -52,7 +55,7 @@ python3 tools/sensenova-u1/retag.py --src 原厂.gguf --config "$SRC" \
   |---|---|
   | 原厂 原版 Q5_K_M | `F16-fm.gguf` |
   | stock Q5_K_M（不加 override） | 同上 |
-  | Q6_K 或将来自己量化的任何 ftype | 同上 |
+  | Q6_K / Q8_0 或将来自己量化的任何 ftype | 同上 |
 
 - 盘上现在只保留一个 sidecar：`F16-fm.gguf`，由转换器从 safetensors 生成。
   `retag.py` 从 原厂 GGUF 拆出的那份张量和 KV 与它逐字节相同，只有文件整体的
@@ -228,7 +231,29 @@ ftype 表（`tools/quantize/quantize.cpp`）里只有 `Q6_K`，传 `Q6_K_M` 会�
 下 KV 约 868 MiB，桌面常驻约 1 GiB，全 offload 会 OOM。用 `-ngl 39`（3 层留
 CPU）可省约 0.95 GiB，`-ngl 38` 更稳；每层落 CPU 在 2720x1536 / 8 步下约多 28 秒。
 
-### 4.5 如果目标是出图质量，而不是复现 原厂
+### 4.5 Q8_0
+
+Q8_0 是本模型能出的最"平"的一档：所有 2D 权重一律 Q8_0（8.5 bit/权重），
+不做分类升位，norm 保持 F32。`llama-quantize` 的默认行为对 Q8_0 本来就是
+这样（`output.weight` 和 `token_embd` 也落到 Q8_0），不需要任何 override。
+
+```bash
+./build/bin/llama-quantize \
+    "$OUT/SenseNova-U1.5-8B-MoT-SFT-8step-V2-F16.gguf" \
+    "$OUT/SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q8_0.gguf" \
+    Q8_0 32
+```
+
+结果：590 个 Q8_0 + 338 个 F32，17.28 GiB（8.50 BPW），32 线程 103 秒。
+
+**这一档整卡放不下**：权重 17.28 GiB 已经超过 16 GB 显卡，只能部分卸载
+（`-ngl` 20 上下）或纯 CPU。纯 CPU 出图会比 Q5_K_M 的约 5 分钟更慢
+（Q8_0 权重更大，具体倍数没实测），所以它的用途是显存充裕机器上的精度对照，不是本机的出图档位。
+
+结构上与 Q5_K_M / Q6_K 完全一致：928 个张量，名字和形状逐个相同，只有类型
+不同，同一个 `F16-fm.gguf` 侧载可以直接配。
+
+### 4.6 如果目标是出图质量，而不是复现 原厂
 
 出图分支不跑 lm_head（`src/models/sensenova-u1.cpp` 只在非 gen pass 时构建
 logits），所以 原厂 把 `output.weight` 保成 F16（约 1.16 GiB）对 t2i 没有收益。
@@ -330,6 +355,32 @@ sha256sum check.png u15_8step.png
 `GGML_CUDA=OFF` 的构建，会静默回落到 CPU，一次出图要几十分钟。
 量化工具 `llama-quantize` 用哪个构建都一样，它只跑 CPU。
 
+### 5.4 Q8_0 产物校验
+
+2026-10-26 产出，校验项：
+
+| 项目 | 结果 |
+|---|---|
+| 文件 | `SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q8_0.gguf`，18,551,025,152 字节（17.28 GiB） |
+| 张量 | 928（590 Q8_0 + 338 F32），与 Q5_K_M / Q6_K 的名字和形状逐个相同 |
+| KV | 27 项，与 F16 / Q5_K_M / Q6_K 一致（gguf-py 计数） |
+| 解析 | llama.cpp 自己的 GGUF 解析器可读（`llama-gguf ... r`） |
+| 实跑 | CPU VQA：274 prompt token / 158 answer token，图像描述正确 |
+
+实跑命令（`-ngl 0` 纯 CPU，避开当时被其它任务占满的显卡）：
+
+```bash
+./build-alldev/bin/llama-sensenova-cli \
+    -m $M/SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q8_0.gguf \
+    --fm $M/F16-fm.gguf \
+    -i demo-photo.jpg --vqa --input-max-pixels 262144 \
+    --max-new-tokens 320 -ngl 0 -p "这张图里是什么？一句话回答"
+```
+
+输出：`这是一张放在浅色陶瓷盘子上的红苹果的照片。`
+（VQA 默认开 think 块，`--max-new-tokens` 给小了会在 think 里被截断，
+需要 320 以上才能拿到完整答案。）
+
 ---
 
 ## 6. 常见坑
@@ -351,6 +402,8 @@ sha256sum check.png u15_8step.png
    先只写 LM（不加 `--out-fm`），量化完再单独产 sidecar。
 7. **tokenizer 缓存**：脚本在 `add_lm_kv` 之后才把 `tempfile.tempdir` 指向输出目录，
    避免 transformers 的缓存落到模型目录。
+8. **Q8_0 在 16 GB 卡上放不下**（17.28 GiB 权重）。要跑只能 `-ngl 20` 上下部分
+   卸载，或纯 CPU；别照抄 `-ngl 999`，会直接 OOM。
 
 ---
 
@@ -365,6 +418,7 @@ sha256sum check.png u15_8step.png
 | `...-F16.gguf` | 34.91 GB | 路线 A 的 F16 LM（928 张量） | 再量化才需要，可从 safetensors 重建（约 12 分钟） |
 | `...-Q5_K_M.gguf` | 12.52 GB | stock Q5_K_M（无 override），文字比 原厂 清楚 | 保留，当前质量基线 |
 | `...-Q6_K.gguf` | 14.32 GB | 全量 Q6_K（590 权重），A 的精度超集 | 出图对比中，2720x1536 需 `-ngl 39` |
+| `...-Q8_0.gguf` | 18.55 GB | 全量 Q8_0（590 权重），17.28 GiB / 8.50 BPW | 保留，精度对照；16 GB 卡放不下，需 `-ngl 20` 上下 |
 
 验证厂商配方时产出的 `mine-Q5_K_M.gguf` 与 原厂 原文件逐张量逐字节相同，
 验证完成后已删除，不占空间。
@@ -387,6 +441,8 @@ sha256sum check.png u15_8step.png
 | FM | `F16-fm.gguf`（121 MiB） |
 | 转换 | 11 分 23 秒 |
 | 量化 Q5_K_M | 60-83 秒 |
+| 量化 Q6_K | 约 90 秒 |
+| 量化 Q8_0 | 103 秒（32 线程，18,551,025,152 字节） |
 
 ### 8.2 不同分辨率的出图耗时
 

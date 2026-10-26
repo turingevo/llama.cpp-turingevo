@@ -103,9 +103,10 @@ cp build/bin/llama-sensenova-cli /your/prefix/bin/
 | `-m` | `SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q5_K_M.gguf` | 语言模型主干（42 层，含 MoT 生成分支） |
 | `--fm` | `F16-fm.gguf` | FM sidecar：视觉 patch 编码器、timestep MLP、像素头，另含理解侧 vision 权重 |
 
-- LM 可以是任意量化档（Q5_K_M、Q6_K 等），sidecar 一份 F16 通用，与量化等级无关。
+- LM 可以是任意量化档（Q5_K_M、Q6_K、Q8_0 等），sidecar 一份 F16 通用，与量化等级无关。
 - 程序会检查 sidecar 的 `sensenova_u1_fm.n_embd` 与模型 embedding 维度是否一致，不一致直接报错退出。
 - `Q6_K` 权重 13.34 GiB，2720x1536 在 16 GB 卡上需降到 `-ngl 39`。
+- `Q8_0` 权重 17.28 GiB，整卡放不下，需 `-ngl 20` 上下或纯 CPU。
 
 默认位置：
 

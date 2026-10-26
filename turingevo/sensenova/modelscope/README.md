@@ -32,6 +32,25 @@
 
 参数口径：官方标称 8B；GGUF 内同时含理解侧与生成侧两套分支，逐张量统计约 17.45B。上下文 16384，42 层，embedding 4096。
 
+### 其它量化等级
+
+本仓库只提供上表的 Q5_K_M。Q6_K（13.34 GiB）和 Q8_0（17.28 GiB）可以自行量化，流程是官方 safetensors -> F16 -> `llama-quantize`（细节见 [量化方法](https://github.com/turingevo/llama.cpp-turingevo/blob/turingevo/turingevo/sensenova/SenseNova-U1-量化方法.md)）：
+
+```bash
+# 1. safetensors -> F16 LM + FM sidecar
+python tools/sensenova-u1/convert_sensenova.py --src <官方权重目录> --config <官方权重目录> \
+    --out SenseNova-U1.5-8B-MoT-SFT-8step-V2-F16.gguf --out-fm F16-fm.gguf
+
+# 2. F16 -> 目标档位（Q6_K / Q8_0）
+./build/bin/llama-quantize \
+    SenseNova-U1.5-8B-MoT-SFT-8step-V2-F16.gguf \
+    SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q6_K.gguf Q6_K
+```
+
+- 侧载 `F16-fm.gguf` 与量化等级无关，量化几次都用同一份，不用重做。
+- Q6_K：16 GB 卡上跑 2720x1536 需 `-ngl 39`。
+- Q8_0：17.28 GiB 权重已超过 16 GB 卡，只能部分卸载或纯 CPU。
+
 ## 快速开始
 
 ### 构建

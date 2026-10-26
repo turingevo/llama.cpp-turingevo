@@ -312,7 +312,8 @@ vocab 151936。图像侧 patch_size 16、merge_size 2，即 1 个图像 token �
 - 256x256 / 2 步冒烟通过，无 NaN。
 - CPU 与 CUDA 两个构建都能跑，CUDA 约 40 倍加速。
 - 2720x1536 / 8 步在 CUDA 上跑通（Q5_K_M，43/43 层在 GPU，计算缓冲 885 MiB）；
-  Q6_K 权重更大（13.34 GiB），同分辨率建议 `-ngl 39`。
+  Q6_K 权重更大（13.34 GiB），同分辨率建议 `-ngl 39`；
+  Q8_0 权重 17.28 GiB，16 GB 卡放不下，需 `-ngl 20` 上下或纯 CPU。
 - VQA 在 CPU 上跑通：1024x512 测试图正确读出 `ZEBRA-7391`；
   2720x1536 的 4094 token 前缀预填充通过（计算缓冲 930 MiB）。
 - VQA 在 GPU 上端到端跑通：2720x1536 图 + 一句问题，prompt 4099 tokens，
