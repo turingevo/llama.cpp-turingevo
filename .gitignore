@@ -51,6 +51,7 @@
 /vulkan-shaders-gen
 /rpc-server
 /out/
+/turingevo/out/
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
