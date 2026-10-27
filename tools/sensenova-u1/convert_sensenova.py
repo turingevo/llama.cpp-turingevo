@@ -107,7 +107,8 @@ def fm_groups(src: Shards):
         raise SystemExit("cannot determine pixel head type")
 
     groups = [(retag.FM_MAP[n], n) for n in sorted(names) if n in retag.FM_MAP]
-    if len(groups) != 16:
+    # 16 generation tensors, plus 4 understanding-branch vision tensors when present
+    if len(groups) not in (16, 20):
         raise SystemExit(f"unexpected FM tensor count: {len(groups)}")
     return groups, "conv" if has_conv else "linear"
 
