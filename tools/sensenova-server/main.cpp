@@ -29,6 +29,8 @@ struct server_args {
     std::string model_name = "sensenova-u1.5";
     std::string output_dir;
     bool allow_output_dir  = false;
+    std::vector<std::string> cpu_tensors;
+    bool fm_cpu = false;
     int port    = 8080;
     int ngl     = 999;
     int threads = 0;
@@ -46,7 +48,10 @@ static void print_usage(const char * prog) {
             "      --model-name NAME   model id reported by /v1/models (default: sensenova-u1.5)\n"
             "      --output-dir PATH   directory for url responses (default: <tmp>/llama-sensenova-server)\n"
             "      --allow-output-dir  accept output_dir from /v1/infographic/generate\n"
-            "  -ngl N                  layers to offload to GPU (default: 999)\n"
+            "  -ngl N                  layers to offload to GPU, counts the output layer too\n"
+            "                          (default: 999, 43 is all of this model)\n"
+            "  -ot, --override-tensor PATTERN=cpu  keep matching weights on CPU, repeatable\n"
+            "      --fm-cpu            run the FM sidecar on the CPU, frees its GPU buffers\n"
             "  -t, --threads N         CPU threads (default: number of cores)\n"
             "\n"
             "endpoints:\n"
@@ -88,6 +93,17 @@ static bool parse_args(int argc, char ** argv, server_args & a) {
             a.allow_output_dir = true;
         } else if (arg == "-ngl") {
             const char * v = next(arg.c_str()); if (!v) return false; a.ngl = atoi(v);
+        } else if (arg == "-ot" || arg == "--override-tensor") {
+            const char * v = next(arg.c_str()); if (!v) return false;
+            const std::string kv = v;
+            const size_t sep = kv.rfind('=');
+            if (sep == std::string::npos || sep == 0 || kv.substr(sep + 1) != "cpu") {
+                fprintf(stderr, "error: only PATTERN=cpu is supported for %s\n", arg.c_str());
+                return false;
+            }
+            a.cpu_tensors.push_back(kv.substr(0, sep));
+        } else if (arg == "--fm-cpu") {
+            a.fm_cpu = true;
         } else if (arg == "-t" || arg == "--threads") {
             const char * v = next(arg.c_str()); if (!v) return false; a.threads = atoi(v);
         } else if (arg == "-h" || arg == "--help") {
@@ -526,11 +542,12 @@ int main(int argc, char ** argv) {
     const auto load_t0 = std::chrono::steady_clock::now();
     std::string err;
     fprintf(stderr, "loading model %s\n", a.model.c_str());
-    std::unique_ptr<sensenova_model> model = sensenova_model_load(a.model, a.fm, a.ngl, a.threads, err);
+    std::unique_ptr<sensenova_model> model = sensenova_model_load(a.model, a.fm, a.ngl, a.threads, err, a.cpu_tensors);
     if (!model) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
+    model->fm_cpu = a.fm_cpu;
     const double load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - load_t0).count();
     const int64_t start_epoch = (int64_t) std::time(nullptr);
