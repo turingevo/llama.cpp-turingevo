@@ -105,8 +105,10 @@ cp build/bin/llama-sensenova-cli /your/prefix/bin/
 
 - LM 可以是任意量化档（Q5_K_M、Q6_K、Q8_0 等），sidecar 一份 F16 通用，与量化等级无关。
 - 程序会检查 sidecar 的 `sensenova_u1_fm.n_embd` 与模型 embedding 维度是否一致，不一致直接报错退出。
-- `Q6_K` 权重 13.34 GiB，2720x1536 在 16 GB 卡上需降到 `-ngl 39`。
-- `Q8_0` 权重 17.28 GiB，整卡放不下，需 `-ngl 20` 上下或纯 CPU。
+- `Q6_K` 权重 13.34 GiB，2720x1536 想全 GPU 要按下面「显存不够时」加
+  `-ot` 和 `--fm-cpu`，实测 34.5 秒；不加就得降 `-ngl`。
+- `Q8_0` 权重 17.28 GiB，即使把 embd/output 放 CPU 仍超过整卡可用显存，
+  需 `-ngl 20` 上下或纯 CPU。
 
 默认位置：
 
@@ -145,6 +147,8 @@ python3 tools/sensenova-u1/convert_sensenova.py \
 sidecar 的张量个数决定能力：拆出 16 个张量（没有理解侧 vision 权重）只能文生图；
 拆出 20 个张量（多出 `vision_und.*`）才能做图像编辑。
 `retag.py` 会打印实际拆出的个数，缺权重时也会打印一行提示。
+`convert_sensenova.py` 同理：HF 权重里有 `vision_model.embeddings.*` 时产出 20 个，
+没有时产出 16 个。
 
 注意：上游 `conversion/sensenova_u1.py` 会过滤 `_mot_gen` 张量
 （`if not name.startswith("language_model.") or "_mot_gen" in name: return None`），
@@ -213,7 +217,9 @@ wrote out.png
 | `--top-p F` | 0.95 | VQA / interleave nucleus 采样 |
 | `--repeat-penalty F` | 1.0 | VQA / interleave 重复惩罚 |
 | `--answer-output PATH` | 无 | 把 VQA 答案 / interleave 全文（含 `<image>` 标记）写到文件 |
-| `-ngl N` | 999 | offload 到 GPU 的层数；CPU 构建下无效 |
+| `-ngl N` | 999 | offload 到 GPU 的层数，**含 output 层**：42 层模型要 `-ngl 43` 才是全部，`-ngl 42` 会留 layer 0 在 CPU；CPU 构建下无效 |
+| `-ot, --override-tensor PATTERN=cpu` | 无 | 把匹配的权重放到 CPU，可重复。PATTERN 是正则、子串匹配，建议写成 `'^token_embd\.weight$=cpu'` 这种锚定形式 |
+| `--fm-cpu` | 关 | FM sidecar（视觉编码器、像素头）跑在 CPU。2720x1536 省约 760 MiB 显存，代价是每张图多约 16 秒 |
 | `-t, --threads N` | 0（由 llama.cpp 取核心数） | CPU 线程数 |
 | `-h, --help` | | 打印用法 |
 
@@ -233,7 +239,37 @@ n_ctx = 条件前缀 + 图像条件前缀 + 无条件前缀 + 图像 token + 16
 ```
 
 图像条件前缀和无条件前缀只在需要 CFG 时实际使用，但公式里始终计入；
-`--think` 时再加上 `--max-think-tokens` 的余量。
+`--think` 时再加上 `--max-think-tokens` 的余量。2720x1536、1196 token 前缀时
+`n_ctx` 是 5376，KV 882 MiB。
+
+### 4.1 显存不够时
+
+三个开关，按性价比排序：
+
+| 开关 | 省显存 | 代价 |
+|---|---|---|
+| `-ot '^token_embd\.weight$=cpu' -ot '^output\.weight$=cpu'` | 974 MiB 权重，另加约 2.6 GiB 的 logits 缓冲 | 基本为零：embedding 只查约 1200 个 prompt token，出图不走 lm_head |
+| `--fm-cpu` | 约 760 MiB（121 MiB 权重 + 约 640 MiB 图缓冲） | 2720x1536 / 8 步多约 16 秒 |
+| 降 `-ngl` | 每层 302 MiB（Q6_K）+ 21 MiB KV | 每层多约 28 秒 |
+
+Q6_K 在 2720x1536 全 GPU 的最小配置：
+
+```bash
+M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
+
+./build-alldev/bin/llama-sensenova-cli \
+  -m $M/SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q6_K.gguf \
+  --fm $M/F16-fm.gguf \
+  -p "a red apple on a wooden table" \
+  --width 2720 --height 1536 --steps 8 --cfg 1.0 --seed 42 \
+  --fm-cpu -ngl 43 \
+  -ot '^token_embd\.weight$=cpu' -ot '^output\.weight$=cpu' \
+  -o q6k.png
+```
+
+实测 34.5 秒，峰值 15,831 / 16,376 MiB（43/43 层在 CUDA0，GPU 权重 12,681 MiB），
+只剩 107 MiB，跑图时别再开占显存的程序。注意 `-ot` 必须锚定，写
+`output\.weight` 会把 42 个 `blk.N.attn_output.weight` 一起挪到 CPU。
 
 ---
 
@@ -470,9 +506,10 @@ M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 | CPU 1024x1024 / 8 步 | 约 5 分钟 |
 | CPU 256x256 / 2 步 | 9.2 s |
 | CUDA VQA 2720x1536（4099 token 前缀 + 109 token 回答） | 3.0 s |
+| CUDA 2720x1536 / 8 步，Q6_K 全 GPU（`--fm-cpu` + 两个 `-ot`） | 34.5 s，峰值 15.8 GiB |
 
 显存占用（1024x1024）：权重 12.7 GiB + KV 252 MiB + compute buffer 211 MiB，
-峰值约 13.5 GiB。2720x1536 的 KV 会涨到约 0.9 GiB，仍在 16 GB 内。
+峰值约 13.5 GiB。2720x1536 的 KV 是 882 MiB（`n_ctx` 5376）。
 VQA 的前缀带上图像 token 会更长：2720x1536 时约 4100 token，compute buffer 约 0.9 GiB。
 
 ---

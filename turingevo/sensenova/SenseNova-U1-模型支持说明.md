@@ -76,13 +76,14 @@ HF 原始权重的命名是 `language_model.model.layers.N...`，且视觉编码
 
 ```
 /media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp/
-  SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q5_K_M.gguf   12.7 GiB  LM
-  F16-fm.gguf                                       121 MiB  FM sidecar
+  SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q5_K_M.gguf   11.66 GiB  LM（stock 配方）
+  F16-fm.gguf                                        154 MiB  FM sidecar
 ```
 
-sidecar 共 16 个张量：patch_embedding(w,b)、dense_embedding(w,b)、
-timestep mlp.0/mlp.2(w,b)、noise_scale mlp.0/mlp.2(w,b)、fm_head conv1/conv2(w,b)。
-权重 F16、bias F32。
+sidecar 共 20 个张量：生成侧 16 个是 patch_embedding(w,b)、dense_embedding(w,b)、
+timestep mlp.0/mlp.2(w,b)、noise_scale mlp.0/mlp.2(w,b)、fm_head conv1/conv2(w,b)；
+另 4 个 `vision_und.*` 是理解侧视觉编码器，编辑和 VQA 用。权重 F16、bias F32。
+源权重里没有理解侧那组时只能拆出 16 个（121 MiB），文生图不受影响。
 
 `head_type` 用来区分两种像素头：`conv` 是 V1.5 的 `ConvDecoder`
 （conv1 -> GELU -> conv2 -> pixel shuffle），`linear` 是 V3 的线性头
@@ -102,7 +103,7 @@ Q5_K_M 的实际选型规则、vendor 配方的 override 和一致性验证结�
 
 | 项目 | 8step-V2-Q5_K_M | base-Q5_K_M |
 |---|---|---|
-| 文件 | 12.7 GiB (LM) + 121 MiB (FM) | 14.07 GiB（单文件全量） |
+| 文件 | 12.7 GiB (LM) + 154 MiB (FM) | 14.07 GiB（单文件全量） |
 | 张量数 | 928 | 1116 |
 | 命名 | retag 后（`blk.N.*`） | HF 原始命名 |
 | token_embd | F16，1187 MiB | F16，1187 MiB |
@@ -115,6 +116,9 @@ Q5_K_M 的实际选型规则、vendor 配方的 override 和一致性验证结�
 
 要点：
 
+- 上表是 原厂 配方。本地现在用的是 stock 配方（`llama-quantize` 默认）：
+  Q5_K_M 11.66 GiB、Q6_K 13.34 GiB、Q8_0 17.28 GiB，三者都是 590 权重 + 338 F32 norm，
+  共用同一个 `F16-fm.gguf`。
 - 两边都**没有**量化 embedding 和 lm_head，都保留 RMSNorm 为 F32。
 - base 版大 1.35 GiB，主要就是 `lm_head` 用 F32（2.37 GiB）而 8step 用 F16。
 - base 版按 Q5_K_M 惯例把 `v_proj` 升到 Q6_K；8step 版全部 Q5_K。
@@ -311,8 +315,9 @@ vocab 151936。图像侧 patch_size 16、merge_size 2，即 1 个图像 token �
 - cfg > 1 双序列路径可跑通（含 seq 1 的 KV 复用与释放）。
 - 256x256 / 2 步冒烟通过，无 NaN。
 - CPU 与 CUDA 两个构建都能跑，CUDA 约 40 倍加速。
-- 2720x1536 / 8 步在 CUDA 上跑通（Q5_K_M，43/43 层在 GPU，计算缓冲 885 MiB）；
-  Q6_K 权重更大（13.34 GiB），同分辨率建议 `-ngl 39`；
+- 2720x1536 / 8 步在 CUDA 上跑通（Q5_K_M，43/43 层在 GPU，计算缓冲 885 MiB）。
+- Q6_K 同分辨率全 GPU 跑通：`--fm-cpu` 加 `-ot '^token_embd\.weight$=cpu'`
+  `-ot '^output\.weight$=cpu'`，34.5 秒，峰值 15,831 MiB（见量化方法 4.4）。
   Q8_0 权重 17.28 GiB，16 GB 卡放不下，需 `-ngl 20` 上下或纯 CPU。
 - VQA 在 CPU 上跑通：1024x512 测试图正确读出 `ZEBRA-7391`；
   2720x1536 的 4094 token 前缀预填充通过（计算缓冲 930 MiB）。

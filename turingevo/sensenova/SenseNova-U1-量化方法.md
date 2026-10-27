@@ -10,7 +10,8 @@
 - 新增 `tools/sensenova-u1/convert_sensenova.py`：safetensors -> F16 LM GGUF +
   FM sidecar，命名表、q/k norm 拼接、FM 张量划分全部复用 `retag.py`，两条路
   径产出的张量名和 KV 完全一致。
-- F16 LM：928 张量、34.9 GB；FM sidecar：16 张量、121 MiB。转换总耗时 11 分 23 秒。
+- F16 LM：928 张量、34.9 GB；FM sidecar：16 或 20 张量、121 或 154 MiB（多出的 4 个
+  是编辑用的理解侧视觉权重）。转换总耗时 11 分 23 秒。
 - `llama-quantize` 配 4 个 override 可产出与 原厂 文件**逐张量逐字节一致**的
   Q5_K_M（12.70 GiB），出图 sha256 与现有基线相同。
 - 不加 override 的 stock Q5_K_M（11.66 GiB）也能用，但配方与 原厂 不同，
@@ -46,7 +47,10 @@ python3 tools/sensenova-u1/retag.py --src 原厂.gguf --config "$SRC" \
 - **名字来源**：FM 是 原厂 自己的命名（Flow Matching 模块组，代码里是
   `fm_modules` / `FlowMatchingHead` / `fm_head`）；sidecar 是本项目加的概念，
   指从主权重里拆出来、单独传给 `--fm` 的那个 GGUF。
-- **内容固定**：sidecar 在转换时一次写定，8 个权重 F16 + 8 个 bias F32，共 121 MiB。
+- **内容固定**：sidecar 在转换时一次写定，权重 F16、bias F32。当前 `F16-fm.gguf`
+  有 20 个张量（10 权重 + 10 bias），共 154 MiB；其中 4 个 `vision_und.*` 是理解侧
+  视觉编码器，只有图像编辑和 VQA 用。HF 权重里没有理解侧那组时只能拆出 16 个
+  （121 MiB），文生图不受影响。
   之后 LM 量化成 F16 / Q5_K_M / Q6_K / Q8_0 都不影响它。`llama-quantize`
   只有一个模型输入，加载的是 LM 的 arch，全程不碰 sidecar。
 - **配对方式**是一份 LM 配一份 sidecar，任意量化等级共用同一个 sidecar：
@@ -108,11 +112,12 @@ LM GGUF（928 张量）：
 | 其余权重（attn、FFN、embedding、lm_head，und + gen 两套） | F16，590 个 |
 | tokenizer / hparams / chat template | KV，27 项 |
 
-FM sidecar（16 张量）：
+FM sidecar（16 或 20 张量）：
 
 | 内容 | 类型 |
 |---|---|
 | patch embed / dense merge conv、timestep MLP、noise-scale MLP、像素头 | 权重 F16，bias F32，各 8 个 |
+| 理解侧 vision（`vision_und.*`，编辑 / VQA 用，HF 有权重时才有） | 权重 F16，bias F32，各 2 个 |
 | sidecar 参数 | KV，16 项（`sensenova_u1_fm.*`） |
 
 几个必须保持的细节：
@@ -227,9 +232,32 @@ ftype 表（`tools/quantize/quantize.cpp`）里只有 `Q6_K`，传 `Q6_K_M` 会�
 结果是 590 个权重全部 Q6_K、338 个 norm 保持 F32，共 13.34 GiB（6.56 BPW），
 纯 CPU 约 90 秒。这是 stock Q5_K_M 的精度超集：所有张量的位宽都不低于它。
 
-显存要注意：每层 Q6_K 恰好 302 MiB，42 层加 embd/output 共 13.34 GiB；2720x1536
-下 KV 约 868 MiB，桌面常驻约 1 GiB，全 offload 会 OOM。用 `-ngl 39`（3 层留
-CPU）可省约 0.95 GiB，`-ngl 38` 更稳；每层落 CPU 在 2720x1536 / 8 步下约多 28 秒。
+显存：每层 Q6_K 恰好 302 MiB，42 层加 embd/output 共 13.34 GiB。2720x1536 下
+KV 882 MiB、LLM 计算缓冲 870 MiB、FM 图缓冲约 640 MiB、桌面约 1.1 GiB，
+不动别的开关会超出约 0.4 GiB。2026-10-27 实测可以全 GPU 跑通的最小配置：
+
+```bash
+./build-alldev/bin/llama-sensenova-cli \
+    -m "$OUT/SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q6_K.gguf" \
+    --fm "$OUT/F16-fm.gguf" -p "$(cat prompt.txt)" \
+    --width 2720 --height 1536 --steps 8 --cfg 1.0 --seed 42 \
+    --fm-cpu -ngl 43 \
+    -ot '^token_embd\.weight$=cpu' -ot '^output\.weight$=cpu' \
+    -o q6k_full.png
+```
+
+- `-ot` 把 token_embd 和 output 放 CPU，省 974 MiB 权重；更要紧的是 output 放 CPU 后，
+  为 4080 个输出 token 准备的 logits 缓冲（约 2.6 GiB）也跟着离开显卡。不加这两个
+  override 时，即使权重装得下，也会在一个 2,661.72 MiB 的缓冲上崩掉。
+- `--fm-cpu` 把 FM sidecar 放到 CPU，再省约 760 MiB（121 MiB 权重 + 约 640 MiB 图缓冲）。
+  代价是 2720x1536 / 8 步从约 18 秒涨到约 34.5 秒。
+- `-ngl 43` 才是全部上卡：这个 build 把 output 也算一层（42 + 1），
+  `-ngl 42` 会留 layer 0 在 CPU，`-ngl 39` 会留 4 层。
+
+实测：34.51 秒出图，43/43 层在 CUDA0，GPU 权重 12,681 MiB，峰值 15,831 MiB
+（总量 16,376），只剩 107 MiB。余量很小，跑图时别开占显存的程序。
+如果不想用 `--fm-cpu`，就得降 `-ngl`，每层 CPU 在 2720x1536 / 8 步下约多 28 秒，
+明显比 FM 落 CPU 贵。
 
 ### 4.5 Q8_0
 
@@ -326,8 +354,10 @@ stock Q5_K_M 与 原厂 的 86 个差异张量（4.2 节明细）：
 新转换器产出的 sidecar（现盘上的 `F16-fm.gguf`）与 `retag.py` 从 原厂 文件
 拆出的 sidecar：
 
-- 16 个张量内容逐字节相同，16 个 KV 相同；
-- 用新 sidecar 配 原厂 LM 出图，与基线 PNG **逐字节相同**；
+- 生成侧 16 个张量内容逐字节相同，16 个 KV 相同；
+- 用转换器产出的 sidecar 配 原厂 LM 出图，与基线 PNG **逐字节相同**；
+- 当前 `F16-fm.gguf` 是后来补齐的 20 张量版本，多出 4 个 `vision_und.*`
+  （编辑 / VQA 用），生成侧 16 个没变；
 - 两个文件的整体字节不同（写入顺序与对齐差异），但张量和 KV 一致，
   不影响加载和结果。retag 产出的那份验证后未保留。
 
@@ -385,7 +415,7 @@ sha256sum check.png u15_8step.png
 
 ## 6. 常见坑
 
-1. **不要量化 FM sidecar。** 它只有 16 个张量，卷积走 `conv_2d_direct`，
+1. **不要量化 FM sidecar。** 它只有 16 到 20 个张量，卷积走 `conv_2d_direct`，
    量化没有收益；而且 arch 是 `sensenova_u1_fm`，`llama-quantize` 走
    `llama_model_loader` 加载时根本不认这个架构。它本身与 LM 的量化等级无关，
    一份可以配任何 ftype，见 2.1 节。
@@ -402,8 +432,18 @@ sha256sum check.png u15_8step.png
    先只写 LM（不加 `--out-fm`），量化完再单独产 sidecar。
 7. **tokenizer 缓存**：脚本在 `add_lm_kv` 之后才把 `tempfile.tempdir` 指向输出目录，
    避免 transformers 的缓存落到模型目录。
-8. **Q8_0 在 16 GB 卡上放不下**（17.28 GiB 权重）。要跑只能 `-ngl 20` 上下部分
-   卸载，或纯 CPU；别照抄 `-ngl 999`，会直接 OOM。
+8. **Q8_0 在 16 GB 卡上放不下**（17.28 GiB 权重）。把 embd/output 放 CPU 也只省
+   约 1.3 GiB，仍超过整卡可用显存，只能 `-ngl 20` 上下部分卸载或纯 CPU；
+   别照抄 `-ngl 999`，会直接 OOM。
+9. **CLI 的 `-ot` 也是正则匹配。** 只写 `output\.weight` 会连 42 个
+   `blk.N.attn_output.weight` 一起挪到 CPU（日志里会看到 44 个张量被 override）。
+   要锚定：`'^output\.weight$=cpu'`、`'^token_embd\.weight$=cpu'`。
+10. **`-ngl` 把 output 也算一层。** `llama-model.cpp` 用
+   `i_gpu_start = n_layer_all + 1 - n_gpu_layers`，42 层模型的 `-ngl 43` 才是全部；
+   `-ngl 42` 会把 layer 0 留在 CPU。
+11. **全 GPU 不能只调 `-ngl`。** 不带 `-ot` 时，embeddings 上下文会为
+   `n_batch`=4080 个输出 token 预留 logits 缓冲（2720x1536 下 2,661.72 MiB），
+   权重再小也会在这一步 OOM。
 
 ---
 
@@ -414,10 +454,10 @@ sha256sum check.png u15_8step.png
 | 文件 | 大小 | 内容 | 去留 |
 |---|---|---|---|
 | `Q5_K_M-厂家方案.gguf` | 13.64 GB | 原厂 原版 LM，F16 x 2 + F32 x 338 + Q5_K x 588 | 保留，对照用 |
-| `F16-fm.gguf` | 121 MiB | FM sidecar，转换器从 safetensors 产出 | 保留，出图必需，配任何 LM |
+| `F16-fm.gguf` | 154 MiB | FM sidecar，20 张量（16 生成 + 4 理解侧） | 保留，出图 / 编辑都必需，配任何 LM |
 | `...-F16.gguf` | 34.91 GB | 路线 A 的 F16 LM（928 张量） | 再量化才需要，可从 safetensors 重建（约 12 分钟） |
 | `...-Q5_K_M.gguf` | 12.52 GB | stock Q5_K_M（无 override），文字比 原厂 清楚 | 保留，当前质量基线 |
-| `...-Q6_K.gguf` | 14.32 GB | 全量 Q6_K（590 权重），A 的精度超集 | 出图对比中，2720x1536 需 `-ngl 39` |
+| `...-Q6_K.gguf` | 14.32 GB | 全量 Q6_K（590 权重），A 的精度超集 | 已验证 2720x1536 全 GPU，见 4.4 |
 | `...-Q8_0.gguf` | 18.55 GB | 全量 Q8_0（590 权重），17.28 GiB / 8.50 BPW | 保留，精度对照；16 GB 卡放不下，需 `-ngl 20` 上下 |
 
 验证厂商配方时产出的 `mine-Q5_K_M.gguf` 与 原厂 原文件逐张量逐字节相同，
@@ -438,7 +478,7 @@ sha256sum check.png u15_8step.png
 | CUDA 选项 | `GGML_CUDA=ON`、`GGML_CUDA_FA=ON`、`GGML_CUDA_FA_ALL_QUANTS=ON` |
 | CPU 选项 | `GGML_BLAS=ON`（OpenBLAS）、`GGML_OPENMP=ON`、`GGML_NATIVE=ON` |
 | LM | `SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q5_K_M.gguf`（12.52 GB，stock 配方，11.66 GiB） |
-| FM | `F16-fm.gguf`（121 MiB） |
+| FM | `F16-fm.gguf`（154 MiB，20 张量） |
 | 转换 | 11 分 23 秒 |
 | 量化 Q5_K_M | 60-83 秒 |
 | 量化 Q6_K | 约 90 秒 |
@@ -476,13 +516,33 @@ prompt 为 `a red apple on a wooden table`（258 prompt token）。
 - 固定成本约 5 s，小图（<=512）几乎全耗在加载上，总时间看不出差别。
 - 每步耗时与图像 token 近似线性，约 0.33-0.42 ms/token/step；
   1024x1024 的 335 ms/步是常用参考点。
-- 2720x1536 在 16 GB 卡上不需要降 `-ngl`（峰值 14.5 GiB，还剩约 1.5 GiB）；
-  只有 Q6_K 权重更大时才需要 `-ngl 39`。**前提是短 prompt**：prompt 变长后
-  `n_ctx` 和 KV 线性增长，4457 token 的 prompt 在 2720x1536 会 OOM，
-  需 `-ngl 41`（约 197 s），或降到 2048x1152 保持全 GPU（约 14 s）。
+- 2720x1536 用 Q5_K_M 不需要降 `-ngl`（峰值 14.5 GiB，还剩约 1.5 GiB）。
+  Q6_K 权重多 1.7 GiB，全上卡要按 4.4 节加 `-ot` 和 `--fm-cpu`，否则降层。
+  **前提是短 prompt**：prompt 变长后 `n_ctx` 和 KV 线性增长，4457 token 的
+  prompt 在 2720x1536 会 OOM，需降 `-ngl`，或降到 2048x1152 保持全 GPU（约 14 s）。
 - 每个尺寸只跑一次；重复跑 1024x1024 得到 7.87 s / 8.04 s，抖动在 0.2 s 内。
 - 首次运行（CUDA 上下文冷启动）会多约 6 s：256x256 首跑 11.7 s，热跑 5.4 s。
 
 > 本节旧版记录的"2720x1536 / 8 步出图 约 90 秒"在当前构建下无法复现
 > （本轮实测 17.7 s，相邻的 2048x1152 为 12.3 s），以上表数据为准。
 > 旧数字的测量条件已不可考。
+>
+> 上表的 KV 按旧公式 `n_batch + n_tokens + 16` 预留（2720x1536 时 1,344 MiB）。
+> 2026-10-27 改成「最长前缀 + 图像 token + 16」，同一分辨率 KV 降到 882 MiB，
+> 峰值相应少约 460 MiB，采样耗时不变。
+
+### 8.3 Q6_K 全 GPU（2720x1536）
+
+2026-10-27 实测，配置见 4.4 节（`--fm-cpu -ngl 43` 加两个 `-ot`）：
+
+| 项目 | 值 |
+|---|---|
+| 总耗时 | 34.51 s（加载约 5 s） |
+| GPU 权重 | 12,681 MiB（43/43 层在 CUDA0） |
+| KV | 882 MiB |
+| LLM 计算缓冲 | 870.74 MiB |
+| 峰值显存 | 15,831 / 16,376 MiB（余 107） |
+
+对照：同 prompt / seed 的 stock Q5_K_M 用相同开关是 33.92 s、峰值 14,158 MiB。
+两者平均像素差 48/255、17x9 分块均值相关 0.834，在 8 步蒸馏模型对权重扰动的
+正常范围内（A 与 原厂 同为 Q5_K_M 时也曾测到 51/255）。
