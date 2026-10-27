@@ -56,7 +56,9 @@ llama-sensenova-server \
 |---|---|---|
 | `--host ADDR` | 127.0.0.1 | 监听地址 |
 | `--port N` | 8888 | 监听端口 |
-| `--ngl N` | 999 | offload 到 GPU 的层数。显存不够时调小，例如 39 |
+| `--ngl N` | 999 | offload 到 GPU 的层数，**含 output 层**：42 层模型要 43 才是全部 |
+| `-ot PATTERN=cpu` | 无 | 把匹配的权重放到 CPU，可重复。模式是正则，建议锚定：`'^token_embd\.weight$=cpu'` |
+| `--fm-cpu` | 关 | FM sidecar 跑在 CPU，省约 760 MiB 显存；2720x1536 每张图慢约 16 秒 |
 | `--model PATH` | 权重目录下的 Q5_K_M | 语言模型 GGUF 全路径 |
 | `--fm PATH` | 权重目录下的 `F16-fm.gguf` | FM sidecar 全路径 |
 | `--model-dir PATH` | 见上文 | 权重目录，给 `--model` / `--fm` 拼默认名用 |
@@ -92,8 +94,13 @@ python3 server.py --port 9000
 # 显存不够，只上 39 层
 python3 server.py -ngl 39
 
-# 换权重（Q6_K 质量更好，但要降 -ngl）
-python3 server.py --model .../SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q6_K.gguf -ngl 39
+# 省显存：embd 和 output 放 CPU，速度、出图都不变
+python3 server.py -ngl 43 \
+  -ot '^token_embd\.weight$=cpu' -ot '^output\.weight$=cpu'
+
+# 换权重：Q6_K 全 GPU（需要再省约 1.6 GiB，所以加 --fm-cpu）
+python3 server.py --model .../SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q6_K.gguf \
+  -ngl 43 -ot '^token_embd\.weight$=cpu' -ot '^output\.weight$=cpu' --fm-cpu
 
 # 先看命令再起
 python3 server.py --dry-run
