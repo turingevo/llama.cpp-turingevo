@@ -331,8 +331,9 @@ for n in sorted(ta):
         bad.append((n, "bytes"))
 print("differing tensors:", len(bad), bad[:10])
 
+# .data 是字段在文件里的片段索引，字符串和数组字段要比较 contents()
 for k in sorted(set(a.fields) & set(b.fields)):
-    if not np.array_equal(a.fields[k].data, b.fields[k].data):
+    if repr(a.fields[k].contents()) != repr(b.fields[k].contents()):
         print("differing kv:", k)
 ```
 
@@ -358,6 +359,9 @@ stock Q5_K_M 与 原厂 的 86 个差异张量（4.2 节明细）：
 - 用转换器产出的 sidecar 配 原厂 LM 出图，与基线 PNG **逐字节相同**；
 - 当前 `F16-fm.gguf` 是后来补齐的 20 张量版本，多出 4 个 `vision_und.*`
   （编辑 / VQA 用），生成侧 16 个没变；
+- 用修好的转换器重做一份，20 个张量逐字节相同、16 项 KV 数值相同，只有
+  `general.name` 和写入顺序不同。`general.name` 只是展示名，工具不读，
+  不影响加载和出图；
 - 两个文件的整体字节不同（写入顺序与对齐差异），但张量和 KV 一致，
   不影响加载和结果。retag 产出的那份验证后未保留。
 
