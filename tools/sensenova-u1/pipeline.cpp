@@ -847,7 +847,10 @@ bool sensenova_model::load_fm(int width, int height, std::string & err) {
     }
 
     if (fm_backend == nullptr) {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_dev_t dev = nullptr;
+        if (!fm_cpu) {
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
         if (dev == nullptr) {
             dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         }
@@ -891,12 +894,22 @@ std::unique_ptr<sensenova_model> sensenova_model_load(
         const std::string & fm_path,
         int ngl,
         int n_threads,
-        std::string & err) {
+        std::string & err,
+        const std::vector<std::string> & cpu_tensors) {
     llama_backend_init();
     ggml_backend_load_all();
 
+    std::vector<llama_model_tensor_buft_override> overrides;
+    for (const auto & pattern : cpu_tensors) {
+        overrides.push_back({ pattern.c_str(), ggml_backend_cpu_buffer_type() });
+    }
+    overrides.push_back({ nullptr, nullptr });
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    if (!cpu_tensors.empty()) {
+        mparams.tensor_buft_overrides = overrides.data();
+    }
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == nullptr) {

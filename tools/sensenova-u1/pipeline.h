@@ -16,6 +16,7 @@ struct sensenova_model {
     int n_embd = 0;
     int ngl = 999;
     int n_threads = 0;
+    bool fm_cpu = false;
 
     // the FM graphs are built for one image size, so the sidecar is cached per size
     std::unique_ptr<fm_context> fm;
@@ -135,7 +136,8 @@ std::unique_ptr<sensenova_model> sensenova_model_load(
         const std::string & fm_path,
         int ngl,
         int n_threads,
-        std::string & err);
+        std::string & err,
+        const std::vector<std::string> & cpu_tensors = {});
 
 bool sensenova_generate(
         sensenova_model & model,

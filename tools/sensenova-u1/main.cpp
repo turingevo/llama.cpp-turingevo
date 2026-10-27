@@ -14,12 +14,14 @@ struct gen_args {
     std::string prompt;
     std::string output = "sensenova-u1.png";
     std::vector<std::string> images;
+    std::vector<std::string> cpu_tensors;
     int width  = 0;
     int height = 0;
     int steps  = 8;
     int seed   = 42;
     int ngl    = 999;
     int threads = 0;
+    bool fm_cpu = false;
     float cfg   = 1.0f;
     float img_cfg = 1.0f;
     float shift = 3.0f;
@@ -77,6 +79,8 @@ static void print_usage(const char * prog) {
             "      --top-p F        --vqa / --interleave nucleus sampling (default: 0.95)\n"
             "      --repeat-penalty F    --vqa / --interleave repetition penalty (default: 1.0)\n"
             "  -ngl N               layers to offload to GPU (default: 999)\n"
+            "  -ot, --override-tensor PATTERN=cpu  keep matching weights on CPU, repeatable\n"
+            "      --fm-cpu         run the FM sidecar on the CPU, frees its GPU buffers\n"
             "  -t, --threads N      CPU threads (default: number of cores)\n",
             prog);
 }
@@ -152,6 +156,17 @@ static bool parse_args(int argc, char ** argv, gen_args & a) {
             const char * v = next(arg.c_str()); if (!v) return false; a.repeat_penalty = (float) atof(v);
         } else if (arg == "-ngl") {
             const char * v = next(arg.c_str()); if (!v) return false; a.ngl = atoi(v);
+        } else if (arg == "-ot" || arg == "--override-tensor") {
+            const char * v = next(arg.c_str()); if (!v) return false;
+            const std::string kv = v;
+            const size_t sep = kv.rfind('=');
+            if (sep == std::string::npos || sep == 0 || kv.substr(sep + 1) != "cpu") {
+                fprintf(stderr, "error: only PATTERN=cpu is supported for %s\n", arg.c_str());
+                return false;
+            }
+            a.cpu_tensors.push_back(kv.substr(0, sep));
+        } else if (arg == "--fm-cpu") {
+            a.fm_cpu = true;
         } else if (arg == "-t" || arg == "--threads") {
             const char * v = next(arg.c_str()); if (!v) return false; a.threads = atoi(v);
         } else if (arg == "-h" || arg == "--help") {
@@ -215,11 +230,12 @@ int main(int argc, char ** argv) {
     }
 
     std::string err;
-    std::unique_ptr<sensenova_model> model = sensenova_model_load(a.model, a.fm, a.ngl, a.threads, err);
+    std::unique_ptr<sensenova_model> model = sensenova_model_load(a.model, a.fm, a.ngl, a.threads, err, a.cpu_tensors);
     if (!model) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
+    model->fm_cpu = a.fm_cpu;
 
     if (a.vqa) {
         sensenova_qa_params q;
