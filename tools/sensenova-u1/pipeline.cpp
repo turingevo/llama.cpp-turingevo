@@ -1161,7 +1161,14 @@ bool sensenova_generate(
     if (think_slack) {
         n_ctx += (uint32_t) p.max_think_tokens + 8;
     }
-    n_ctx = std::max<uint32_t>(n_ctx, n_batch + n_tokens + 16);
+    // the generation block starts right after the longest prefix, not after the
+    // largest batch (the block itself is usually the largest batch)
+    uint32_t max_prefix = (uint32_t) std::max({cond_spec.items.size(), uncond_spec.items.size(),
+            img_cond_spec.items.size()});
+    if (think_slack) {
+        max_prefix += (uint32_t) p.max_think_tokens + 8;
+    }
+    n_ctx = std::max<uint32_t>(n_ctx, max_prefix + n_tokens + 16);
 
     fprintf(stderr, "prompt tokens: cond %zu, img_cond %zu, uncond %zu, image tokens: %d (%dx%d), steps: %d, cfg: %.2f, img_cfg: %.2f%s\n",
             cond_spec.items.size(), img_cond_spec.items.size(), uncond_spec.items.size(),
