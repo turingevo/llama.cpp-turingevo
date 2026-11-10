@@ -111,6 +111,13 @@ std::string gen_tool_call_id();
 const char * get_media_marker();
 
 //
+// audio utils
+//
+
+// float samples to signed 16-bit PCM bytes, clamped to [-1, 1]
+std::string pcm_f32_to_s16(const float * samples, size_t n);
+
+//
 // model output modalities
 //
 
@@ -737,6 +744,7 @@ enum server_role_type {
     SERVER_ROLE_ROUTER,   // no model: lists the models, spawns instances on demand and proxies requests to them
     SERVER_ROLE_INSTANCE, // serves one model, standalone or as a child of a router
     SERVER_ROLE_DOWNLOAD, // child of a router: download a model, report the progress, exit
+    SERVER_ROLE_MEASURE,  // child of a router: report the memory the model needs without loading it, exit
 };
 
 static inline const char * server_role_type_to_str(server_role_type role) {
@@ -744,6 +752,7 @@ static inline const char * server_role_type_to_str(server_role_type role) {
         case SERVER_ROLE_ROUTER:   return "router";
         case SERVER_ROLE_INSTANCE: return "instance";
         case SERVER_ROLE_DOWNLOAD: return "download";
+        case SERVER_ROLE_MEASURE:  return "measure";
         default: GGML_ASSERT(false && "invalid server_role_type");
     }
 }
@@ -752,6 +761,9 @@ static inline const char * server_role_type_to_str(server_role_type role) {
 static inline server_role_type server_role_type_from_str(const std::string & str) {
     if (str == "download") {
         return SERVER_ROLE_DOWNLOAD;
+    }
+    if (str == "measure") {
+        return SERVER_ROLE_MEASURE;
     }
     return SERVER_ROLE_INSTANCE;
 }
@@ -772,6 +784,7 @@ static inline server_role_type server_role_type_from_str(const std::string & str
 // the states a child reports to the router
 enum server_state {
     SERVER_STATE_DOWNLOADING,
+    SERVER_STATE_MEASURING, // sent by a measure child, see server_run_measure
     SERVER_STATE_LOADING,
     SERVER_STATE_READY,
     SERVER_STATE_SLEEPING,
@@ -780,6 +793,7 @@ enum server_state {
 static inline std::string server_state_to_str(server_state state) {
     switch (state) {
         case SERVER_STATE_DOWNLOADING: return "downloading";
+        case SERVER_STATE_MEASURING:   return "measuring";
         case SERVER_STATE_LOADING:     return "loading";
         case SERVER_STATE_READY:       return "ready";
         case SERVER_STATE_SLEEPING:    return "sleeping";
@@ -789,6 +803,7 @@ static inline std::string server_state_to_str(server_state state) {
 
 static inline server_state server_state_from_str(const std::string & str) {
     if (str == "downloading") return SERVER_STATE_DOWNLOADING;
+    if (str == "measuring")   return SERVER_STATE_MEASURING;
     if (str == "loading")     return SERVER_STATE_LOADING;
     if (str == "ready")       return SERVER_STATE_READY;
     if (str == "sleeping")    return SERVER_STATE_SLEEPING;

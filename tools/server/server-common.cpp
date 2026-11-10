@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <random>
 #include <sstream>
@@ -201,6 +203,19 @@ const char * get_media_marker() {
 }
 
 //
+// audio utils
+//
+
+std::string pcm_f32_to_s16(const float * samples, size_t n) {
+    std::string bytes(n * sizeof(int16_t), '\0');
+    for (size_t i = 0; i < n; i++) {
+        const int16_t v = (int16_t) std::lround(std::max(-1.0f, std::min(1.0f, samples[i])) * 32767.0f);
+        memcpy(&bytes[2 * i], &v, sizeof(v));
+    }
+    return bytes;
+}
+
+//
 // model output modalities
 //
 
@@ -219,6 +234,9 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_LFM2_D1:
         case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
         case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+        case COMMON_DECISION_TYPE_MINICPM_OCR_JEV:
+        case COMMON_DECISION_TYPE_LFM3_D1:
+        case COMMON_DECISION_TYPE_LFM3_D1_OMNI:
             out = {"decisions"};
             break;
         case COMMON_DECISION_TYPE_GRANITE_SWITCH:
@@ -1315,7 +1333,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             p.erase("input_video");
             p.erase("video_url");
 
-        } else if (type != "text") {
+        } else if (type != "text" && type != "tool_reference") {
             throw std::invalid_argument("unsupported content[].type");
         }
     }
@@ -1387,10 +1405,14 @@ json oaicompat_chat_params_parse(
                 json_schema = json_value(response_format, "schema", json::object());
             }
         } else if (response_type == "json_schema") {
-            auto schema_wrapper = json_value(response_format, "json_schema", json::object());
-            json_schema = json_value(schema_wrapper, "schema", json::object());
+            if (response_format.contains("json_schema")) {
+                auto schema_wrapper = json_value(response_format, "json_schema", json::object());
+                json_schema = json_value(schema_wrapper, "schema", json::object());
+            } else {
+                json_schema = json_value(response_format, "schema", json::object());
+            }
         } else if (!response_type.empty() && response_type != "text") {
-            throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
+            throw std::invalid_argument("response_format type must be one of \"text\", \"json_object\" or \"json_schema\", but got: " + response_type);
         }
     }
 
@@ -1441,7 +1463,7 @@ json oaicompat_chat_params_parse(
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :

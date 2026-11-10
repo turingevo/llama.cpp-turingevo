@@ -186,6 +186,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/tts",                      ex_wrapper(routes.post_tts));
+    ctx_http.post("/v1/audio/speech",          ex_wrapper(routes.post_speech_oai));
+    ctx_http.post("/audio/speech",             ex_wrapper(routes.post_speech_oai));
     ctx_http.ws  ("/v1/realtime",              routes.ws_realtime);
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
@@ -425,6 +427,45 @@ static int server_run_download(common_params & params, server_role & role) {
 }
 
 //
+// measure worker: a child of the router, reports the memory a model needs without loading it
+//
+
+static int server_run_measure(common_params & params, server_role & role, common_models_handler & models_handler) {
+    // the router sets --offline: only resolve the local path, never download
+    try {
+        common_models_handler_apply(models_handler, params);
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to resolve model: %s\n", e.what());
+        return 1;
+    }
+
+    const std::string model_name = params.model.get_name();
+
+    // TODO: mmproj is not in llama_get_memory_breakdown, a multimodal model is underestimated
+    json payload;
+    try {
+        common_memory_reports m = common_measure_memory(params);
+        payload = {
+            {"result",      "measured"},
+            {"n_ctx_train", m.n_ctx_train},
+            {"min",         server_model_memory(m.n_ctx_min, m.info_min).to_json()},
+            {"max",         server_model_memory(m.n_ctx_max, m.info_max).to_json()},
+        };
+        SRV_INF("memory measured for model name=%s at n_ctx=%u (min) and n_ctx=%u (max)\n",
+            model_name.c_str(), m.n_ctx_min, m.n_ctx_max);
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to measure memory for model name=%s: %s\n", model_name.c_str(), e.what());
+        payload = {
+            {"result", "failed"},
+            {"error",  e.what()},
+        };
+    }
+
+    role.notify_to_router(server_state_to_str(SERVER_STATE_MEASURING), payload);
+    return 0;
+}
+
+//
 // router
 //
 
@@ -465,6 +506,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_responses_oai          = models_routes->proxy_post;
     routes.post_transcriptions_oai     = models_routes->proxy_post;
     routes.post_tts                    = models_routes->proxy_post;
+    routes.post_speech_oai             = models_routes->proxy_post;
     routes.ws_realtime                 = models_routes->proxy_ws;
     routes.post_anthropic_messages     = models_routes->proxy_post;
     routes.post_anthropic_count_tokens = models_routes->proxy_post;
@@ -664,7 +706,12 @@ static int server_run_instance(common_params & params, server_role & role, commo
     std::thread monitor_thread;
     if (role.is_managed_by_router()) {
         monitor_thread = role.setup(shutdown_handler);
-        role.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
+        json info = routes.get_model_info();
+        // the router tracks device memory from these reports
+        if (const auto * ll_ctx = ctx_server.get_llama_context()) {
+            info["memory"] = server_model_memory(llama_n_ctx(ll_ctx), common_memory_breakdown_rows(ll_ctx)).to_json();
+        }
+        role.notify_to_router(server_state_to_str(SERVER_STATE_READY), info);
     }
 
     // this call blocks the main thread until queue_tasks.terminate() is called
@@ -717,6 +764,7 @@ static int server_run(common_params & params, int argc, char ** argv, server_rol
 
     switch (role_type) {
         case SERVER_ROLE_DOWNLOAD: return server_run_download(params, role);
+        case SERVER_ROLE_MEASURE:  return server_run_measure(params, role, models_handler);
         case SERVER_ROLE_ROUTER:   return server_run_router(params, argc, argv, opts);
         case SERVER_ROLE_INSTANCE: return server_run_instance(params, role, models_handler, opts);
     }
