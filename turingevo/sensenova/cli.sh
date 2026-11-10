@@ -6,7 +6,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=/media/wmx/ws1/workspace/ai/llama.cpp
+ROOT=$(cd "$HERE/../.." && pwd)
 MODEL_DIR=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 MODEL=SenseNova-U1.5-8B-MoT-SFT-8step-V2-Q5_K_M.gguf
 FM=F16-fm.gguf

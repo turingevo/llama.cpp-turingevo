@@ -22,9 +22,9 @@
 set -e  # 遇到错误立即退出
 
 # ========== 配置参数 ==========
-src_dir=/media/wmx/ws1/workspace/ai/llama.cpp
+src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 build_dir=${src_dir}/build-alldev
-install_dir=/home/wmx/software/llamacpp
+install_dir=/home/wmx/software/llamacpp-turingevo
 
 # 指定要编译和安装的目标
 TARGETS="llama-cli llama-sensenova-cli llama-sensenova-server llama-mtmd-cli llama-server llama-diffusion llama-diffusion-cli llama-gguf llama-gguf-hash llama-gguf-split llama-batched llama-batched-bench llama-bench llama-quantize llama-perplexity"

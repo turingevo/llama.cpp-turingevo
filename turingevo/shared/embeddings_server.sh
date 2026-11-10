@@ -8,7 +8,7 @@ ebd_model_path=$ebd_prefix/Qwen3-Embedding-0.6B-Q8_0.gguf
 rk_prefix=/media/wmx/soft2/huggingface_cache/BAAI/bge-reranker-base
 rk_model_path=$rk_prefix/bge-reranker-base-q4_k_m.gguf
 
-llama_prefix=/media/wmx/ws1/workspace/ai/llama.cpp/bin/cuda/
+llama_prefix=${LLAMA_PREFIX:-$(cd "$(dirname "$0")/../.." && pwd)/build-alldev}
 llama_path=$llama_prefix/bin/llama-server
 
 

@@ -87,7 +87,7 @@ tokenizer 走 `transformers` 的 `Qwen2Tokenizer`（slow），配置目录里要
 ### 3.2 转换命令
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 
 SRC=/media/wmx/ws3/huggingface_cache/models/image/SenseNova-U1/SenseNova-U1.5-8B-MoT-SFT-8step-V2
 OUT=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
@@ -195,7 +195,7 @@ FM sidecar（16 或 20 张量）：
 要复现，必须关掉两处默认行为：
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 OUT=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 
 ./build/bin/llama-quantize \
@@ -313,7 +313,7 @@ logits），所以 原厂 把 `output.weight` 保成 F16（约 1.16 GiB）对 t2
 对照对象：`Q5_K_M-厂家方案.gguf`（原厂）。
 
 ```python
-# 需要 gguf-py：PYTHONPATH=/media/wmx/ws1/workspace/ai/llama.cpp/gguf-py
+# 需要 gguf-py：PYTHONPATH=/media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo/gguf-py
 import sys
 import numpy as np
 from gguf import GGUFReader
@@ -368,7 +368,7 @@ stock Q5_K_M 与 原厂 的 86 个差异张量（4.2 节明细）：
 ### 5.3 端到端命令
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 
 ./build-alldev/bin/llama-sensenova-cli \

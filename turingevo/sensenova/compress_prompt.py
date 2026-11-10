@@ -7,7 +7,7 @@ sections. Only the fields an image model can use are kept.
 
 usage: compress_prompt.py in.json [-o out.txt] [--stats]
 
- proj_root=/media/wmx/ws1/workspace/ai/llama.cpp
+ proj_root=/media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
  dir=${proj_root}/turingevo/sensenova/prompts
  python3 ${proj_root}/turingevo/sensenova/compress_prompt.py ${dir}/瑞士旅行攻略.json   --level metadata -o ${dir}/瑞士旅行攻略_metadata.txt --stats
  python3 ${proj_root}/turingevo/sensenova/compress_prompt.py ${dir}/瑞士旅行攻略.json   --level compact -o ${dir}/瑞士旅行攻略_compact.txt --stats

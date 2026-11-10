@@ -6,9 +6,7 @@
 # default port=8080 is used by ollama
 PORT=8000
 
-# cpu cuda openblas
-backend=cuda
-llama_prefix=/media/wmx/ws1/workspace/ai/llama.cpp/bin/$backend/
+llama_prefix=${LLAMA_PREFIX:-$(cd "$(dirname "$0")/../.." && pwd)/build-alldev}
 llama_path=$llama_prefix/bin/llama-server
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${llama_prefix}/lib
 

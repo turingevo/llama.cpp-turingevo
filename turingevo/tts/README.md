@@ -35,7 +35,7 @@
 ### 2.1 最快启动
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 python3 turingevo/tts/server.py
 ```
 

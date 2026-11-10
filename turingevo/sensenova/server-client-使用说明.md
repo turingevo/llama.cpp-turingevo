@@ -33,7 +33,7 @@ SenseNova-U1.5 本地服务的一对起停脚本:
 ### 2.1 最快启动
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp/turingevo/sensenova
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo/turingevo/sensenova
 python3 server.py
 ```
 
@@ -167,7 +167,7 @@ python3 server.py --dry-run
 ### 3.3 文生图
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp/turingevo/sensenova
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo/turingevo/sensenova
 
 # 用提示词文件
 python3 client.py -f prompts/菜谱制作.txt -o /tmp/dish.png
@@ -275,7 +275,7 @@ python3 client.py --api infographic -p "a red apple" \
 `POST /v1/interleave/generate`，`client.py --api interleave`：
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp/turingevo/sensenova
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo/turingevo/sensenova
 
 # 默认 think 开，最多 3 张图，无输入图时 1024x1024
 python3 client.py --api interleave \
@@ -353,7 +353,7 @@ python3 client.py --api interleave -p "画一张红苹果" --format url \
 同样的能力也可以直接跑 `llama-sensenova-cli`，适合本机调试：
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 
 ./build-alldev/bin/llama-sensenova-cli \
@@ -381,7 +381,7 @@ CLI 参数与原理见 `llama-sensenova-cli-使用说明.md` 5.2 节。注意 `c
 ## 4. 端到端联调
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp/turingevo/sensenova
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo/turingevo/sensenova
 
 # 1. 起服务（另开一个终端，或加 &）
 python3 server.py &

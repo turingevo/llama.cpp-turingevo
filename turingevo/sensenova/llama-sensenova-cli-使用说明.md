@@ -57,7 +57,7 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 CPU 构建（对应 `build/`）：
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 
 cmake -B build -S . \
   -DCMAKE_BUILD_TYPE=Release \
@@ -160,7 +160,7 @@ sidecar 的张量个数决定能力：拆出 16 个张量（没有理解侧 visi
 ## 3. 基本用法
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 
 M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 
@@ -337,7 +337,7 @@ PNG 采用 stored deflate（不压缩）：1024x1024 约 3.1 MB，2720x1536 约 
 GPU，参考分辨率（供应商对比图用的就是这组参数）：
 
 ```bash
-cd /media/wmx/ws1/workspace/ai/llama.cpp
+cd /media/wmx/ws1/workspace/AI推理部署/llamacpp-turingevo
 M=/media/wmx/soft2/huggingface_cache/models/image/SenseNova/llamacpp
 
 ./build-alldev/bin/llama-sensenova-cli \
